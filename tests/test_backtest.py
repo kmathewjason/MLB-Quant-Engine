@@ -762,3 +762,421 @@ class TestPortfolioCap:
         # Each day's total should respect the daily cap
         for date, grp in result.groupby("bet_date"):
             assert grp["capped_stake_units"].sum() <= 0.10 + 1e-6
+
+
+# ============================================================================
+# NEW Phase 5+ tests — vig_removal diagnostics, kelly risk-free + corr,
+#                       portfolio_cap bootstrap drawdown
+# ============================================================================
+
+class TestVigRemovalDiagnostics:
+    """Tests for the new diagnostic functions added to vig_removal.py."""
+
+    # ── power_devig_inv_k (alias) ─────────────────────────────────────────
+
+    def test_inv_k_alias_identical_to_power(self):
+        """power_devig_inv_k must return exactly the same array as power_devig."""
+        from src.optimizer.vig_removal import power_devig, power_devig_inv_k
+        for odds in [[-110, -110], [-200, 170], [-150, 130, 250]]:
+            np.testing.assert_array_equal(
+                power_devig(odds),
+                power_devig_inv_k(odds),
+            )
+
+    def test_inv_k_sums_to_one(self):
+        from src.optimizer.vig_removal import power_devig_inv_k
+        probs = power_devig_inv_k([-300, 240])
+        assert abs(probs.sum() - 1.0) < 1e-9
+
+    # ── DeVigDivergence / method_divergence ────────────────────────────────
+
+    def test_method_divergence_returns_dataclass(self):
+        from src.optimizer.vig_removal import method_divergence, DeVigDivergence
+        d = method_divergence([-110, -110])
+        assert isinstance(d, DeVigDivergence)
+
+    def test_method_divergence_balanced_market_near_zero(self):
+        """Balanced -110/-110 market: power and additive should almost agree."""
+        from src.optimizer.vig_removal import method_divergence
+        d = method_divergence([-110, -110])
+        assert d.l_inf < 0.01   # < 1 pp disagreement
+
+    def test_method_divergence_lopsided_market_larger(self):
+        """Heavy favourite market: divergence should be larger than balanced."""
+        from src.optimizer.vig_removal import method_divergence
+        d_balanced = method_divergence([-110, -110])
+        d_lopsided = method_divergence([-400, 300])
+        assert d_lopsided.l_inf > d_balanced.l_inf
+
+    def test_method_divergence_js_in_range(self):
+        """JSD must be in [0, 1]."""
+        from src.optimizer.vig_removal import method_divergence
+        d = method_divergence([-200, 170])
+        assert 0.0 <= d.js_divergence <= 1.0
+
+    def test_method_divergence_same_method_zero(self):
+        """Comparing a method with itself should give zero divergence."""
+        from src.optimizer.vig_removal import method_divergence
+        d = method_divergence([-200, 170], method_a="power", method_b="power")
+        assert d.l1 < 1e-9
+        assert d.l_inf < 1e-9
+        assert d.js_divergence < 1e-9
+
+    def test_method_divergence_diff_shape(self):
+        from src.optimizer.vig_removal import method_divergence
+        d = method_divergence([-110, -110, 250])   # 3-way market
+        assert len(d.diff) == 3
+        assert len(d.probs_a) == 3
+
+    def test_method_divergence_to_dict_keys(self):
+        from src.optimizer.vig_removal import method_divergence
+        d = method_divergence([-110, -110])
+        dct = d.to_dict()
+        assert "l1" in dct and "l_inf" in dct and "js_divergence" in dct
+        assert dct["method_a"] == "power"
+        assert dct["method_b"] == "additive"
+
+    # ── FLBResult / favorite_longshot_bias ────────────────────────────────
+
+    def test_flb_returns_correct_fav_idx(self):
+        """For [-200, 170], index 0 is the favourite (higher raw implied prob)."""
+        from src.optimizer.vig_removal import favorite_longshot_bias
+        r = favorite_longshot_bias([-200, 170])
+        assert r.favourite_idx == 0
+
+    def test_flb_positive_for_heavy_favourite(self):
+        """
+        Standard FLB: heavy favourite at -300/+240.
+        Power assigns the favourite more prob than additive does →
+        flb_index > 0.
+        """
+        from src.optimizer.vig_removal import favorite_longshot_bias
+        r = favorite_longshot_bias([-300, 240])
+        assert r.flb_index > 0.0
+
+    def test_flb_near_zero_balanced_market(self):
+        """Balanced market: FLB should be close to zero."""
+        from src.optimizer.vig_removal import favorite_longshot_bias
+        r = favorite_longshot_bias([-110, -110])
+        assert abs(r.flb_index) < 0.05
+
+    def test_flb_prob_fields_in_range(self):
+        from src.optimizer.vig_removal import favorite_longshot_bias
+        r = favorite_longshot_bias([-200, 170])
+        assert 0 < r.power_fav_prob < 1
+        assert 0 < r.additive_fav_prob < 1
+
+    def test_flb_to_dict_structure(self):
+        from src.optimizer.vig_removal import favorite_longshot_bias
+        dct = favorite_longshot_bias([-200, 170]).to_dict()
+        required = {"favourite_idx", "vig_pct", "flb_index",
+                    "power_fav_prob", "additive_fav_prob", "l1", "l_inf"}
+        assert required.issubset(set(dct.keys()))
+
+    def test_flb_divergence_object_attached(self):
+        from src.optimizer.vig_removal import favorite_longshot_bias, DeVigDivergence
+        r = favorite_longshot_bias([-200, 170])
+        assert isinstance(r.divergence, DeVigDivergence)
+
+
+class TestKellyRiskFreeAndCorrMatrix:
+    """Tests for risk_free_rate in portfolio_kelly and simulate_corr_matrix."""
+
+    def _sample_bets_df(self, n=3):
+        return pd.DataFrame({
+            "model_prob":         [0.56, 0.53, 0.55],
+            "fair_odds_american": [-110.0, -105.0, +100.0],
+        }).head(n)
+
+    # ── portfolio_kelly with risk_free_rate ──────────────────────────────
+
+    def test_risk_free_zero_unchanged(self):
+        """r=0 must give same ev as the standard formula."""
+        from src.optimizer.kelly import portfolio_kelly
+        df = self._sample_bets_df()
+        r0 = portfolio_kelly(df, risk_free_rate=0.0)
+        assert "ev_excess" in r0.columns
+        # ev_excess == ev when r=0
+        np.testing.assert_allclose(r0["ev"].values, r0["ev_excess"].values, atol=1e-9)
+
+    def test_risk_free_positive_reduces_ev_excess(self):
+        """Positive r must reduce ev_excess below ev."""
+        from src.optimizer.kelly import portfolio_kelly
+        df = self._sample_bets_df()
+        r_nonzero = portfolio_kelly(df, risk_free_rate=0.01)
+        assert (r_nonzero["ev_excess"].values <= r_nonzero["ev"].values + 1e-9).all()
+
+    def test_risk_free_high_zeroes_stakes(self):
+        """A very high risk-free rate that exceeds EV should zero out all stakes."""
+        from src.optimizer.kelly import portfolio_kelly
+        df = self._sample_bets_df()
+        # r=10 >> any realistic EV → all bets have negative excess return
+        result = portfolio_kelly(df, risk_free_rate=10.0)
+        assert (result["stake_units"].values == 0.0).all()
+
+    def test_ev_excess_column_present(self):
+        from src.optimizer.kelly import portfolio_kelly
+        df = self._sample_bets_df()
+        result = portfolio_kelly(df)
+        assert "ev_excess" in result.columns
+
+    def test_empty_df_with_risk_free(self):
+        from src.optimizer.kelly import portfolio_kelly
+        df = pd.DataFrame(columns=["model_prob", "fair_odds_american"])
+        result = portfolio_kelly(df, risk_free_rate=0.005)
+        assert len(result) == 0
+        assert "ev_excess" in result.columns
+
+    # ── simulate_corr_matrix ─────────────────────────────────────────────
+
+    def _make_pa_probs(self, seed=0):
+        """League-average-ish PA probs for testing (9 batters × 7 outcomes)."""
+        rng = np.random.default_rng(seed)
+        raw = rng.dirichlet(alpha=np.ones(7) * 3, size=9)
+        return raw.astype(np.float64)
+
+    def test_simulate_corr_empty_games(self):
+        from src.optimizer.kelly import simulate_corr_matrix
+        result = simulate_corr_matrix([])
+        assert result.n_sims > 0
+        assert len(result.bet_labels) == 0
+        assert result.cov_matrix.shape == (0, 0)
+
+    def test_simulate_corr_single_game_two_sides(self):
+        """
+        Moneyline home + moneyline away for the same game must be
+        perfectly anti-correlated (one wins iff the other loses,
+        ignoring ties).  Correlation should be ≤ -0.8.
+        """
+        from src.optimizer.kelly import simulate_corr_matrix
+        pa_h = self._make_pa_probs(seed=1)
+        pa_a = self._make_pa_probs(seed=2)
+        games = [
+            {"pa_probs_home": pa_h, "pa_probs_away": pa_a,
+             "side": "home", "outcome": "moneyline", "label": "G1_home"},
+            {"pa_probs_home": pa_h, "pa_probs_away": pa_a,
+             "side": "away", "outcome": "moneyline", "label": "G1_away"},
+        ]
+        result = simulate_corr_matrix(games, n_sims=5_000, rng=np.random.default_rng(0))
+        corr = result.corr_matrix
+        assert corr.shape == (2, 2)
+        # Home vs away should be strongly negatively correlated
+        assert corr[0, 1] < -0.8
+
+    def test_simulate_corr_diagonal_is_one(self):
+        from src.optimizer.kelly import simulate_corr_matrix
+        pa_h = self._make_pa_probs(seed=3)
+        pa_a = self._make_pa_probs(seed=4)
+        games = [
+            {"pa_probs_home": pa_h, "pa_probs_away": pa_a,
+             "side": "home", "outcome": "moneyline", "label": "G1"},
+        ]
+        result = simulate_corr_matrix(games, n_sims=2_000)
+        assert abs(result.corr_matrix[0, 0] - 1.0) < 1e-9
+
+    def test_simulate_corr_win_probs_in_range(self):
+        from src.optimizer.kelly import simulate_corr_matrix
+        pa_h = self._make_pa_probs(seed=5)
+        pa_a = self._make_pa_probs(seed=6)
+        games = [
+            {"pa_probs_home": pa_h, "pa_probs_away": pa_a,
+             "side": "home", "outcome": "moneyline", "label": "G1"},
+            {"pa_probs_home": pa_h, "pa_probs_away": pa_a,
+             "side": "home", "outcome": "over",
+             "total_line": 8.5, "label": "G1_over"},
+        ]
+        result = simulate_corr_matrix(games, n_sims=3_000)
+        assert (result.win_probs >= 0).all()
+        assert (result.win_probs <= 1).all()
+
+    def test_simulate_corr_independent_games_low_corr(self):
+        """
+        Two completely different games (different PA probs) should have
+        near-zero correlation between their moneyline outcomes.
+        """
+        from src.optimizer.kelly import simulate_corr_matrix
+        pa_h1 = self._make_pa_probs(seed=10)
+        pa_a1 = self._make_pa_probs(seed=11)
+        pa_h2 = self._make_pa_probs(seed=12)
+        pa_a2 = self._make_pa_probs(seed=13)
+        games = [
+            {"pa_probs_home": pa_h1, "pa_probs_away": pa_a1,
+             "side": "home", "outcome": "moneyline", "label": "G1"},
+            {"pa_probs_home": pa_h2, "pa_probs_away": pa_a2,
+             "side": "home", "outcome": "moneyline", "label": "G2"},
+        ]
+        result = simulate_corr_matrix(games, n_sims=10_000, rng=np.random.default_rng(42))
+        # Independent games: |correlation| should be small
+        assert abs(result.corr_matrix[0, 1]) < 0.15
+
+    def test_simulate_corr_to_dict_keys(self):
+        from src.optimizer.kelly import simulate_corr_matrix
+        pa_h = self._make_pa_probs(seed=7)
+        pa_a = self._make_pa_probs(seed=8)
+        games = [
+            {"pa_probs_home": pa_h, "pa_probs_away": pa_a,
+             "side": "home", "outcome": "moneyline", "label": "G1"},
+        ]
+        result = simulate_corr_matrix(games, n_sims=500)
+        d = result.to_dict()
+        assert "bet_labels" in d
+        assert "cov_matrix" in d
+        assert "corr_matrix" in d
+
+    def test_portfolio_kelly_with_sim_corr(self):
+        """portfolio_kelly accepts the cov_matrix from simulate_corr_matrix."""
+        from src.optimizer.kelly import simulate_corr_matrix, portfolio_kelly
+        pa_h = self._make_pa_probs(seed=9)
+        pa_a = self._make_pa_probs(seed=10)
+        games = [
+            {"pa_probs_home": pa_h, "pa_probs_away": pa_a,
+             "side": "home", "outcome": "moneyline", "label": "G1_home"},
+            {"pa_probs_home": pa_h, "pa_probs_away": pa_a,
+             "side": "home", "outcome": "over",
+             "total_line": 8.5, "label": "G1_over"},
+        ]
+        sim = simulate_corr_matrix(games, n_sims=2_000, rng=np.random.default_rng(0))
+        bets_df = pd.DataFrame([
+            {"model_prob": float(sim.win_probs[0]), "fair_odds_american": -110.0},
+            {"model_prob": float(sim.win_probs[1]), "fair_odds_american": -110.0},
+        ])
+        result = portfolio_kelly(bets_df, cov_matrix=sim.cov_matrix,
+                                 bankroll=1000.0, max_total_exposure=0.20)
+        assert "stake_units" in result.columns
+        assert (result["stake_units"] >= 0).all()
+        assert result["stake_units"].sum() <= 200.0 + 1.0   # 20% of 1000
+
+
+class TestBootstrapDrawdown:
+    """Tests for bootstrap_drawdown_simulator in portfolio_cap.py."""
+
+    def _bet_log_from_result(self, n=200, win_rate=0.55, odds=-110, seed=0):
+        """Build a simple bet log with result + stake_units + f_kelly + f_star."""
+        rng = np.random.default_rng(seed)
+        results = rng.binomial(1, win_rate, size=n).astype(float)
+        f_star  = np.full(n, 0.05)   # 5% full-Kelly per bet
+        return pd.DataFrame({
+            "result":             results,
+            "fair_odds_american": float(odds),
+            "f_star":             f_star,
+            "f_kelly":            f_star / 4.0,       # quarter-Kelly
+            "stake_units":        f_star / 4.0,
+        })
+
+    def test_returns_one_result_per_divisor(self):
+        from src.optimizer.portfolio_cap import bootstrap_drawdown_simulator
+        df = self._bet_log_from_result()
+        results = bootstrap_drawdown_simulator(
+            df, n_paths=200, kelly_divisors=[1.0, 4.0], kelly_labels=["full", "quarter"]
+        )
+        assert len(results) == 2
+
+    def test_default_four_fractions(self):
+        from src.optimizer.portfolio_cap import bootstrap_drawdown_simulator
+        df = self._bet_log_from_result()
+        results = bootstrap_drawdown_simulator(df, n_paths=200)
+        assert len(results) == 4
+        labels = [r.kelly_label for r in results]
+        assert "full" in labels
+        assert "quarter" in labels
+
+    def test_p95_mdd_non_negative_and_finite(self):
+        """MDD is ≥ 0 and finite; it can exceed 1.0 for aggressive fractions
+        that drive the bankroll negative (technically 'ruin')."""
+        from src.optimizer.portfolio_cap import bootstrap_drawdown_simulator
+        import math
+        df = self._bet_log_from_result()
+        results = bootstrap_drawdown_simulator(df, n_paths=300)
+        for r in results:
+            assert r.p95_max_drawdown >= 0.0
+            assert math.isfinite(r.p95_max_drawdown)
+
+    def test_full_kelly_worse_drawdown_than_quarter(self):
+        """
+        Full Kelly should have a higher p95 max drawdown than quarter-Kelly
+        for a positive-edge bet series.
+        """
+        from src.optimizer.portfolio_cap import bootstrap_drawdown_simulator
+        df = self._bet_log_from_result(n=300, win_rate=0.55, seed=1)
+        results = bootstrap_drawdown_simulator(
+            df, n_paths=500,
+            kelly_divisors=[1.0, 4.0],
+            kelly_labels=["full", "quarter"],
+            rng=np.random.default_rng(0),
+        )
+        full    = next(r for r in results if r.kelly_label == "full")
+        quarter = next(r for r in results if r.kelly_label == "quarter")
+        assert full.p95_max_drawdown >= quarter.p95_max_drawdown
+
+    def test_terminal_bankroll_higher_for_full_kelly_positive_edge(self):
+        """
+        Full Kelly should have a higher *median* terminal bankroll than quarter-Kelly
+        when there is genuine positive edge (not guaranteed, but true in expectation).
+        """
+        from src.optimizer.portfolio_cap import bootstrap_drawdown_simulator
+        df = self._bet_log_from_result(n=400, win_rate=0.60, seed=2)
+        results = bootstrap_drawdown_simulator(
+            df, n_paths=500,
+            kelly_divisors=[1.0, 4.0],
+            kelly_labels=["full", "quarter"],
+            rng=np.random.default_rng(42),
+        )
+        full    = next(r for r in results if r.kelly_label == "full")
+        quarter = next(r for r in results if r.kelly_label == "quarter")
+        assert full.p50_terminal_bankroll >= quarter.p50_terminal_bankroll
+
+    def test_empty_bet_log(self):
+        from src.optimizer.portfolio_cap import bootstrap_drawdown_simulator
+        results = bootstrap_drawdown_simulator(pd.DataFrame(), n_paths=100)
+        assert len(results) == 4
+        for r in results:
+            assert r.p95_max_drawdown == 0.0
+            assert r.n_bets == 0
+
+    def test_mismatched_label_divisor_raises(self):
+        from src.optimizer.portfolio_cap import bootstrap_drawdown_simulator
+        df = self._bet_log_from_result()
+        with pytest.raises(ValueError, match="kelly_labels length"):
+            bootstrap_drawdown_simulator(
+                df, kelly_divisors=[1.0, 4.0], kelly_labels=["only_one"]
+            )
+
+    def test_to_dict_keys(self):
+        from src.optimizer.portfolio_cap import bootstrap_drawdown_simulator
+        df = self._bet_log_from_result()
+        results = bootstrap_drawdown_simulator(df, n_paths=100)
+        for r in results:
+            d = r.to_dict()
+            required = {"kelly_divisor", "kelly_label", "p95_max_drawdown",
+                        "p50_max_drawdown", "p95_terminal_bankroll", "n_bets"}
+            assert required.issubset(set(d.keys()))
+
+    def test_percentile_ordering(self):
+        """p05 ≤ p50 ≤ p95 for max drawdown."""
+        from src.optimizer.portfolio_cap import bootstrap_drawdown_simulator
+        df = self._bet_log_from_result(n=100, seed=3)
+        results = bootstrap_drawdown_simulator(df, n_paths=400)
+        for r in results:
+            assert r.p05_max_drawdown <= r.p50_max_drawdown <= r.p95_max_drawdown
+
+    def test_with_pnl_units_column(self):
+        """bet_log can come directly from CLV tracker (has pnl_units column)."""
+        from src.optimizer.portfolio_cap import bootstrap_drawdown_simulator
+        import math
+        rng = np.random.default_rng(5)
+        n = 100
+        results_col = rng.binomial(1, 0.55, n).astype(float)
+        stakes = np.full(n, 0.02)
+        pnl = np.where(results_col == 1, stakes * 0.909, -stakes)
+        df = pd.DataFrame({
+            "result":      results_col,
+            "stake_units": stakes,
+            "f_kelly":     stakes,
+            "f_star":      stakes * 4,
+            "pnl_units":   pnl,
+        })
+        results = bootstrap_drawdown_simulator(df, n_paths=200)
+        assert len(results) == 4
+        for r in results:
+            assert r.p95_max_drawdown >= 0.0
+            assert math.isfinite(r.p95_max_drawdown)

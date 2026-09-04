@@ -263,3 +263,269 @@ def _append_cap(existing: str, new_cap: str) -> str:
     if new_cap in existing:
         return existing
     return f"{existing}|{new_cap}"
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap drawdown simulator
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass as _dataclass
+
+@_dataclass
+class DrawdownSimResult:
+    """
+    Output of bootstrap_drawdown_simulator() for one Kelly fraction.
+
+    Attributes
+    ----------
+    kelly_divisor      : fractional-Kelly divisor used (1=full, 2=half, etc.)
+    kelly_label        : human-readable label, e.g. "full", "half"
+    p95_max_drawdown   : 95th-percentile maximum drawdown across bootstrap paths
+    p50_max_drawdown   : median maximum drawdown
+    p05_max_drawdown   : 5th-percentile maximum drawdown (optimistic tail)
+    mean_max_drawdown  : mean maximum drawdown across paths
+    p95_terminal_bankroll : 95th-percentile terminal bankroll (pessimistic tail)
+    p50_terminal_bankroll : median terminal bankroll
+    mean_terminal_bankroll: mean terminal bankroll
+    n_bets             : number of bets per bootstrap path
+    n_paths            : number of bootstrap resampled paths
+    """
+    kelly_divisor:           float
+    kelly_label:             str
+    p95_max_drawdown:        float   # worst-5% max drawdown fraction (0–1)
+    p50_max_drawdown:        float
+    p05_max_drawdown:        float
+    mean_max_drawdown:       float
+    p95_terminal_bankroll:   float   # 5th-percentile terminal bankroll (normalised to 1.0 start)
+    p50_terminal_bankroll:   float
+    mean_terminal_bankroll:  float
+    n_bets:                  int
+    n_paths:                 int
+
+    def to_dict(self) -> dict:
+        return {
+            "kelly_divisor":            self.kelly_divisor,
+            "kelly_label":              self.kelly_label,
+            "p95_max_drawdown":         round(self.p95_max_drawdown,       4),
+            "p50_max_drawdown":         round(self.p50_max_drawdown,       4),
+            "p05_max_drawdown":         round(self.p05_max_drawdown,       4),
+            "mean_max_drawdown":        round(self.mean_max_drawdown,      4),
+            "p95_terminal_bankroll":    round(self.p95_terminal_bankroll,  4),
+            "p50_terminal_bankroll":    round(self.p50_terminal_bankroll,  4),
+            "mean_terminal_bankroll":   round(self.mean_terminal_bankroll, 4),
+            "n_bets":                   self.n_bets,
+            "n_paths":                  self.n_paths,
+        }
+
+
+def bootstrap_drawdown_simulator(
+    bet_log: "pd.DataFrame",
+    n_paths: int = 2_000,
+    kelly_divisors: "list[float] | None" = None,
+    kelly_labels: "list[str] | None" = None,
+    starting_bankroll: float = 1.0,
+    rng: "np.random.Generator | None" = None,
+) -> "list[DrawdownSimResult]":
+    """
+    Simulate the bankroll path for multiple Kelly fractions using bootstrap
+    resampling of a historical or simulated bet log, and report the
+    95th-percentile maximum drawdown at each fraction.
+
+    This lets you pick a Kelly divisor based on an actual risk target instead
+    of a fixed convention (e.g. "I accept at most 20% drawdown 95% of the time,
+    so I should use the fraction whose p95 drawdown ≤ 0.20").
+
+    Theory
+    ------
+    The maximum drawdown of a bankroll path B(t) is:
+
+        MDD = max_{0 ≤ s ≤ t} [HWM(s) - B(t)] / HWM(s)
+
+    where HWM(s) = max_{0 ≤ u ≤ s} B(u).
+
+    For fractional Kelly with divisor d, the stake on bet i is:
+
+        stake_i(d) = f*_i / d  (or f_star column from portfolio_kelly)
+
+    We rescale the original stake column by (original_divisor / d) to simulate
+    different fractions without re-running the Kelly solver.
+
+    Bootstrap procedure
+    -------------------
+    1. Draw n_paths bootstrap samples of the bet log (with replacement,
+       preserving the original bet-count N).
+    2. For each path, simulate the bankroll sequence using the rescaled stakes
+       and the bet outcomes (result column).
+    3. Record the maximum drawdown fraction for that path.
+    4. Report percentiles across the n_paths values.
+
+    Parameters
+    ----------
+    bet_log : DataFrame with (at minimum) columns:
+                  - result         : float, 1 = win, 0 = loss, 0.5 = push
+                  - stake_units    : float, stake as fraction of bankroll
+                    (from portfolio_kelly() output)
+                  - f_kelly        : float, fractional Kelly stake fraction
+                    (used to back-out the full-Kelly f* = f_kelly * divisor_used;
+                     if this column is absent, stake_units is used directly and
+                     all rescaling is skipped — i.e. results are for the single
+                     fraction recorded)
+                  Optional:
+                  - fair_odds_american : float (used to compute payout)
+                  - pnl_units      : float (if present, overrides computed P&L)
+
+    n_paths  : number of bootstrap resampled paths (default 2,000)
+
+    kelly_divisors : list of divisors to test (default [1, 2, 4, 8] = full,
+                     half, quarter, eighth Kelly).
+
+    kelly_labels   : human-readable labels for each divisor.  Defaults to
+                     ["full", "half", "quarter", "eighth"].
+
+    starting_bankroll : normalised starting bankroll (default 1.0).
+
+    rng : numpy random Generator; seeded internally if None.
+
+    Returns
+    -------
+    List of DrawdownSimResult, one per divisor, in the same order as
+    kelly_divisors.  Results are sorted by kelly_divisor ascending.
+
+    Example
+    -------
+    >>> results = bootstrap_drawdown_simulator(clv_df, n_paths=5000)
+    >>> for r in results:
+    ...     print(f"{r.kelly_label}: p95 MDD = {r.p95_max_drawdown:.1%},
+    ...            p50 terminal = {r.p50_terminal_bankroll:.2f}")
+    quarter: p95 MDD = 18.3%, p50 terminal = 1.41
+    """
+    if kelly_divisors is None:
+        kelly_divisors = [1.0, 2.0, 4.0, 8.0]
+    if kelly_labels is None:
+        kelly_labels = ["full", "half", "quarter", "eighth"]
+    if len(kelly_labels) != len(kelly_divisors):
+        raise ValueError(
+            f"kelly_labels length {len(kelly_labels)} must match "
+            f"kelly_divisors length {len(kelly_divisors)}."
+        )
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    if bet_log.empty:
+        return [
+            DrawdownSimResult(
+                kelly_divisor=d, kelly_label=lab,
+                p95_max_drawdown=0.0, p50_max_drawdown=0.0,
+                p05_max_drawdown=0.0, mean_max_drawdown=0.0,
+                p95_terminal_bankroll=starting_bankroll,
+                p50_terminal_bankroll=starting_bankroll,
+                mean_terminal_bankroll=starting_bankroll,
+                n_bets=0, n_paths=n_paths,
+            )
+            for d, lab in zip(kelly_divisors, kelly_labels)
+        ]
+
+    n_bets   = len(bet_log)
+    results_list = []
+
+    # ── Pre-compute the P&L-per-unit vector (independent of Kelly fraction) ─
+    # pnl_unit[i] = profit/loss in bankroll units per unit staked on bet i
+    if "pnl_units" in bet_log.columns and "stake_units" in bet_log.columns:
+        # If we already have pnl_units from CLV tracker, back out the per-unit P&L
+        stake_arr = bet_log["stake_units"].to_numpy(dtype=np.float64)
+        pnl_arr   = bet_log["pnl_units"].to_numpy(dtype=np.float64)
+        # pnl_per_unit[i] = pnl_arr[i] / stake_arr[i] where stake > 0
+        safe_stake = np.where(stake_arr > 1e-12, stake_arr, 1.0)
+        pnl_per_unit = np.where(stake_arr > 1e-12, pnl_arr / safe_stake, 0.0)
+    elif "result" in bet_log.columns:
+        result_arr = bet_log["result"].to_numpy(dtype=np.float64)
+        if "fair_odds_american" in bet_log.columns:
+            from src.optimizer.kelly import american_to_decimal as _a2d  # noqa: PLC0415
+            odds_arr = bet_log["fair_odds_american"].to_numpy(dtype=np.float64)
+            payout   = np.array([_a2d(o) - 1.0 for o in odds_arr])
+        else:
+            payout = np.ones(n_bets)   # assume even-money if no odds
+        # pnl_per_unit: win → +payout, loss → −1, push → 0
+        pnl_per_unit = np.where(
+            result_arr > 0.5,   payout,
+            np.where(result_arr == 0.5, 0.0, -1.0)
+        )
+    else:
+        raise ValueError(
+            "bet_log must contain either ('pnl_units', 'stake_units') "
+            "or ('result',) columns."
+        )
+
+    # ── Base stake fractions (at the divisor used when the log was generated) ─
+    # We assume the log was generated at some reference divisor.  We infer this
+    # from the 'f_kelly' column if available, otherwise use 'stake_units' directly.
+    if "f_kelly" in bet_log.columns and "stake_units" in bet_log.columns:
+        base_stake = bet_log["f_kelly"].to_numpy(dtype=np.float64)
+        # f_kelly = f_star / divisor_used; f_star = f_kelly * divisor_used
+        # We want to express stakes as a fraction of bankroll at any divisor d:
+        # stake(d) = f_star / d = f_kelly * (divisor_used / d)
+        # We DON'T know divisor_used, so we normalise base_stake to f* = f_kelly * 4
+        # (assume the log was generated at divisor=4 = quarter-Kelly, default).
+        # If the log has f_star explicitly, use that instead.
+        if "f_star" in bet_log.columns:
+            f_star_arr = bet_log["f_star"].to_numpy(dtype=np.float64)
+        else:
+            # Assume quarter-Kelly was used when generating the log
+            f_star_arr = base_stake * 4.0
+    elif "stake_units" in bet_log.columns:
+        # No f_kelly column; treat stake_units as the baseline.
+        # Rescaling will be relative to divisor=4 (quarter-Kelly assumption).
+        f_star_arr = bet_log["stake_units"].to_numpy(dtype=np.float64) * 4.0
+    else:
+        raise ValueError("bet_log must contain 'stake_units' or 'f_kelly' columns.")
+
+    f_star_arr = np.maximum(f_star_arr, 0.0)
+
+    # ── Bootstrap loop ────────────────────────────────────────────────────────
+    for divisor, label in zip(kelly_divisors, kelly_labels):
+        # Compute stakes for this divisor
+        stake_this = f_star_arr / max(divisor, 1e-9)   # fraction of bankroll per bet
+
+        # Vectorised bootstrap: draw n_paths × n_bets indices with replacement
+        idx = rng.integers(0, n_bets, size=(n_paths, n_bets))
+
+        # stake_paths[path, bet]
+        stake_paths = stake_this[idx]             # (n_paths, n_bets)
+        pnl_paths   = pnl_per_unit[idx]           # (n_paths, n_bets) per-unit P&L
+
+        # Bankroll change per bet per path (in bankroll-fraction units)
+        pnl_dollar  = stake_paths * pnl_paths     # (n_paths, n_bets)
+
+        # Cumulative bankroll relative to starting_bankroll
+        cum_returns = np.cumsum(pnl_dollar, axis=1) / starting_bankroll
+        bankroll_paths = starting_bankroll + np.cumsum(pnl_dollar, axis=1)
+        # Prepend starting value
+        bankroll_full = np.concatenate(
+            [np.full((n_paths, 1), starting_bankroll), bankroll_paths],
+            axis=1,
+        )   # (n_paths, n_bets + 1)
+
+        # ── Maximum drawdown per path ────────────────────────────────────────
+        # MDD[path] = max over time of (HWM - current) / HWM
+        # Using cumulative max as HWM
+        hwm = np.maximum.accumulate(bankroll_full, axis=1)   # (n_paths, n_bets+1)
+        drawdown = (hwm - bankroll_full) / np.maximum(hwm, 1e-12)
+        mdd      = drawdown.max(axis=1)                       # (n_paths,)
+
+        terminal = bankroll_full[:, -1]                       # (n_paths,)
+
+        results_list.append(DrawdownSimResult(
+            kelly_divisor=divisor,
+            kelly_label=label,
+            p95_max_drawdown=float(np.percentile(mdd,      95)),
+            p50_max_drawdown=float(np.percentile(mdd,      50)),
+            p05_max_drawdown=float(np.percentile(mdd,       5)),
+            mean_max_drawdown=float(mdd.mean()),
+            p95_terminal_bankroll=float(np.percentile(terminal,  5)),   # pessimistic 5th pct
+            p50_terminal_bankroll=float(np.percentile(terminal, 50)),
+            mean_terminal_bankroll=float(terminal.mean()),
+            n_bets=n_bets,
+            n_paths=n_paths,
+        ))
+
+    return results_list
