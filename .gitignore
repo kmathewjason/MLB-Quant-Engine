@@ -1,0 +1,48 @@
+# Environment
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data (raw/processed — too large for git; track externally with DVC)
+data/raw/
+data/processed/
+data/predictions/
+
+# Model artifacts
+models/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node / React dashboard
+mlb-dashboard/node_modules/
+mlb-dashboard/dist/
+mlb-dashboard/.env
