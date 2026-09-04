@@ -1,0 +1,281 @@
+{
+  "1": {
+    "name": "Angel Stadium",
+    "team": "Los Angeles Angels",
+    "city": "Anaheim, CA",
+    "lat": 33.8003,
+    "lon": -117.8827,
+    "elevation_m": 43,
+    "orientation_degrees": 205
+  },
+  "2": {
+    "name": "Minute Maid Park",
+    "team": "Houston Astros",
+    "city": "Houston, TX",
+    "lat": 29.7573,
+    "lon": -95.3555,
+    "elevation_m": 15,
+    "orientation_degrees": 4
+  },
+  "3": {
+    "name": "Oakland Coliseum",
+    "team": "Oakland Athletics",
+    "city": "Oakland, CA",
+    "lat": 37.7516,
+    "lon": -122.2005,
+    "elevation_m": 4,
+    "orientation_degrees": 330
+  },
+  "4": {
+    "name": "Globe Life Field",
+    "team": "Texas Rangers",
+    "city": "Arlington, TX",
+    "lat": 32.7473,
+    "lon": -97.0831,
+    "elevation_m": 168,
+    "orientation_degrees": 15
+  },
+  "5": {
+    "name": "T-Mobile Park",
+    "team": "Seattle Mariners",
+    "city": "Seattle, WA",
+    "lat": 47.5914,
+    "lon": -122.3325,
+    "elevation_m": 5,
+    "orientation_degrees": 348
+  },
+  "10": {
+    "name": "Oriole Park at Camden Yards",
+    "team": "Baltimore Orioles",
+    "city": "Baltimore, MD",
+    "lat": 39.2838,
+    "lon": -76.6218,
+    "elevation_m": 11,
+    "orientation_degrees": 340
+  },
+  "11": {
+    "name": "Fenway Park",
+    "team": "Boston Red Sox",
+    "city": "Boston, MA",
+    "lat": 42.3467,
+    "lon": -71.0972,
+    "elevation_m": 5,
+    "orientation_degrees": 93
+  },
+  "12": {
+    "name": "Guaranteed Rate Field",
+    "team": "Chicago White Sox",
+    "city": "Chicago, IL",
+    "lat": 41.8300,
+    "lon": -87.6338,
+    "elevation_m": 179,
+    "orientation_degrees": 4
+  },
+  "13": {
+    "name": "Progressive Field",
+    "team": "Cleveland Guardians",
+    "city": "Cleveland, OH",
+    "lat": 41.4962,
+    "lon": -81.6852,
+    "elevation_m": 180,
+    "orientation_degrees": 338
+  },
+  "14": {
+    "name": "Comerica Park",
+    "team": "Detroit Tigers",
+    "city": "Detroit, MI",
+    "lat": 42.3390,
+    "lon": -83.0485,
+    "elevation_m": 183,
+    "orientation_degrees": 348
+  },
+  "15": {
+    "name": "Kauffman Stadium",
+    "team": "Kansas City Royals",
+    "city": "Kansas City, MO",
+    "lat": 39.0517,
+    "lon": -94.4803,
+    "elevation_m": 299,
+    "orientation_degrees": 4
+  },
+  "16": {
+    "name": "Target Field",
+    "team": "Minnesota Twins",
+    "city": "Minneapolis, MN",
+    "lat": 44.9817,
+    "lon": -93.2781,
+    "elevation_m": 264,
+    "orientation_degrees": 344
+  },
+  "17": {
+    "name": "Yankee Stadium",
+    "team": "New York Yankees",
+    "city": "Bronx, NY",
+    "lat": 40.8296,
+    "lon": -73.9262,
+    "elevation_m": 15,
+    "orientation_degrees": 4
+  },
+  "18": {
+    "name": "Oakland Coliseum",
+    "team": "Oakland Athletics",
+    "city": "Oakland, CA",
+    "lat": 37.7516,
+    "lon": -122.2005,
+    "elevation_m": 4,
+    "orientation_degrees": 330
+  },
+  "19": {
+    "name": "Tropicana Field",
+    "team": "Tampa Bay Rays",
+    "city": "St. Petersburg, FL",
+    "lat": 27.7683,
+    "lon": -82.6534,
+    "elevation_m": 5,
+    "orientation_degrees": 18
+  },
+  "20": {
+    "name": "Rogers Centre",
+    "team": "Toronto Blue Jays",
+    "city": "Toronto, ON",
+    "lat": 43.6414,
+    "lon": -79.3894,
+    "elevation_m": 76,
+    "orientation_degrees": 2
+  },
+  "21": {
+    "name": "Truist Park",
+    "team": "Atlanta Braves",
+    "city": "Cumberland, GA",
+    "lat": 33.8907,
+    "lon": -84.4677,
+    "elevation_m": 296,
+    "orientation_degrees": 22
+  },
+  "22": {
+    "name": "Wrigley Field",
+    "team": "Chicago Cubs",
+    "city": "Chicago, IL",
+    "lat": 41.9484,
+    "lon": -87.6553,
+    "elevation_m": 180,
+    "orientation_degrees": 92
+  },
+  "23": {
+    "name": "Great American Ball Park",
+    "team": "Cincinnati Reds",
+    "city": "Cincinnati, OH",
+    "lat": 39.0975,
+    "lon": -84.5067,
+    "elevation_m": 148,
+    "orientation_degrees": 349
+  },
+  "24": {
+    "name": "Coors Field",
+    "team": "Colorado Rockies",
+    "city": "Denver, CO",
+    "lat": 39.7559,
+    "lon": -104.9942,
+    "elevation_m": 1580,
+    "orientation_degrees": 347
+  },
+  "25": {
+    "name": "Dodger Stadium",
+    "team": "Los Angeles Dodgers",
+    "city": "Los Angeles, CA",
+    "lat": 34.0739,
+    "lon": -118.2400,
+    "elevation_m": 165,
+    "orientation_degrees": 330
+  },
+  "26": {
+    "name": "loanDepot park",
+    "team": "Miami Marlins",
+    "city": "Miami, FL",
+    "lat": 25.7781,
+    "lon": -80.2197,
+    "elevation_m": 2,
+    "orientation_degrees": 354
+  },
+  "27": {
+    "name": "American Family Field",
+    "team": "Milwaukee Brewers",
+    "city": "Milwaukee, WI",
+    "lat": 43.0280,
+    "lon": -87.9712,
+    "elevation_m": 188,
+    "orientation_degrees": 4
+  },
+  "28": {
+    "name": "Citi Field",
+    "team": "New York Mets",
+    "city": "Flushing, NY",
+    "lat": 40.7571,
+    "lon": -73.8458,
+    "elevation_m": 10,
+    "orientation_degrees": 346
+  },
+  "29": {
+    "name": "Citizens Bank Park",
+    "team": "Philadelphia Phillies",
+    "city": "Philadelphia, PA",
+    "lat": 39.9057,
+    "lon": -75.1665,
+    "elevation_m": 9,
+    "orientation_degrees": 354
+  },
+  "30": {
+    "name": "PNC Park",
+    "team": "Pittsburgh Pirates",
+    "city": "Pittsburgh, PA",
+    "lat": 40.4469,
+    "lon": -80.0057,
+    "elevation_m": 220,
+    "orientation_degrees": 345
+  },
+  "31": {
+    "name": "Busch Stadium",
+    "team": "St. Louis Cardinals",
+    "city": "St. Louis, MO",
+    "lat": 38.6226,
+    "lon": -90.1928,
+    "elevation_m": 141,
+    "orientation_degrees": 357
+  },
+  "32": {
+    "name": "Petco Park",
+    "team": "San Diego Padres",
+    "city": "San Diego, CA",
+    "lat": 32.7076,
+    "lon": -117.1570,
+    "elevation_m": 6,
+    "orientation_degrees": 305
+  },
+  "33": {
+    "name": "Oracle Park",
+    "team": "San Francisco Giants",
+    "city": "San Francisco, CA",
+    "lat": 37.7786,
+    "lon": -122.3893,
+    "elevation_m": 5,
+    "orientation_degrees": 113
+  },
+  "34": {
+    "name": "Nationals Park",
+    "team": "Washington Nationals",
+    "city": "Washington, DC",
+    "lat": 38.8730,
+    "lon": -77.0074,
+    "elevation_m": 4,
+    "orientation_degrees": 349
+  },
+  "35": {
+    "name": "Chase Field",
+    "team": "Arizona Diamondbacks",
+    "city": "Phoenix, AZ",
+    "lat": 33.4453,
+    "lon": -112.0667,
+    "elevation_m": 331,
+    "orientation_degrees": 7
+  }
+}

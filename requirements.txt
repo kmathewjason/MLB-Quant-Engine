@@ -11,5 +11,6 @@ pybaseball>=2.2.7
 requests>=2.32.0
 python-dotenv>=1.0.0
 pytest>=8.2.0
+pytest-mock>=3.14.0
 httpx2>=0.28.0
 pydantic>=2.7.0
