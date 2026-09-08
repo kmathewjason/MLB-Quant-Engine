@@ -161,8 +161,16 @@ def devig_pair(odds_a: int | float, odds_b: int | float) -> tuple[float, float]:
 # Internal HTTP helper
 # ---------------------------------------------------------------------------
 
-def _fetch(endpoint: str, params: dict[str, Any]) -> Any:
-    """GET _API_BASE/endpoint with API key and retry/backoff."""
+def _fetch(endpoint: str, params: dict[str, Any], max_retries: int | None = None) -> Any:
+    """
+    GET _API_BASE/endpoint with API key and retry/backoff.
+
+    Parameters
+    ----------
+    max_retries : if 0, try exactly once with NO urllib3-level retries and a
+                  short timeout (fail-fast for live API endpoints).
+                  If None, use the full _RETRY_DELAYS schedule.
+    """
     api_key = os.getenv("ODDS_API_KEY", "")
     if not api_key:
         raise EnvironmentError(
@@ -171,11 +179,35 @@ def _fetch(endpoint: str, params: dict[str, Any]) -> Any:
     params = {**params, "apiKey": api_key}
     url = f"{_API_BASE}/{endpoint.lstrip('/')}"
 
+    # Fail-fast mode: mount a Session with Retry(total=0) so urllib3 does not
+    # retry on connection errors (SSL handshake failures, etc.), and use a
+    # short connect timeout so the call fails in <3 s instead of 30 s.
+    if max_retries == 0:
+        from requests.adapters import HTTPAdapter  # noqa: PLC0415
+        from urllib3.util.retry import Retry        # noqa: PLC0415
+        sess = requests.Session()
+        adapter = HTTPAdapter(max_retries=Retry(total=0, raise_on_status=False))
+        sess.mount("https://", adapter)
+        sess.mount("http://",  adapter)
+        try:
+            resp = sess.get(url, params=params, timeout=(3, 8))  # (connect, read)
+            remaining = resp.headers.get("x-requests-remaining")
+            if remaining is not None:
+                logger.debug("Odds API quota remaining: %s", remaining)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as exc:
+            logger.warning("Odds API (try_once) failed: %s", exc)
+            raise RuntimeError(f"Odds API unreachable: {url}") from exc
+        finally:
+            sess.close()
+
+    # Normal mode: retry with backoff
+    delays: tuple[float, ...] = _RETRY_DELAYS
     last_exc: Exception | None = None
-    for attempt, delay in enumerate((*_RETRY_DELAYS, None), start=1):
+    for attempt, delay in enumerate((*delays, None), start=1):
         try:
             resp = requests.get(url, params=params, timeout=_TIMEOUT)
-            # Log quota headers if present
             remaining = resp.headers.get("x-requests-remaining")
             if remaining is not None:
                 logger.debug("Odds API quota remaining: %s", remaining)
@@ -187,7 +219,7 @@ def _fetch(endpoint: str, params: dict[str, Any]) -> Any:
             if delay is not None:
                 time.sleep(delay)
 
-    raise RuntimeError(f"Odds API unreachable after retries: {url}") from last_exc
+    raise RuntimeError(f"Odds API unreachable: {url}") from last_exc
 
 
 # ---------------------------------------------------------------------------
@@ -287,15 +319,19 @@ def get_game_odds(
     regions: str = "us",
     markets: tuple[str, ...] | list[str] = _GAME_MARKETS,
     force_refresh: bool = False,
+    try_once: bool = False,
 ) -> list[GameOdds]:
     """
     Return game-level odds for all upcoming MLB games.
 
     Parameters
     ----------
-    regions  : comma-separated region string e.g. "us,uk"
-    markets  : iterable of market keys to fetch
+    regions       : comma-separated region string e.g. "us,uk"
+    markets       : iterable of market keys to fetch
     force_refresh : bypass cache
+    try_once      : if True, attempt the HTTP call exactly once with no
+                    retry delays (use in live API endpoints to avoid
+                    blocking the request for 30+ seconds on failure).
 
     Returns
     -------
@@ -308,12 +344,12 @@ def get_game_odds(
         cached = _cache_load(cache_key)
         if cached is not None:
             logger.debug("Odds cache hit: %s", cache_key)
-            # Re-hydrate nested lists from stored flat format
             return cached  # type: ignore[return-value]
 
     events = _fetch(
         f"sports/{_SPORT}/odds",
         params={"regions": regions, "markets": markets_str, "oddsFormat": "american"},
+        max_retries=0 if try_once else None,
     )
 
     result: list[GameOdds] = []

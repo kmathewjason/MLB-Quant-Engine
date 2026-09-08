@@ -1,6 +1,15 @@
 /**
  * Axios API client for the MLB Quant Engine backend.
  * All URLs are relative — Vite's dev proxy forwards /api/* to FastAPI.
+ *
+ * Timeouts
+ * --------
+ * DAILY_TIMEOUT_MS  : 25 s — covers schedule fetch + 15 games × simulation.
+ *                     No retries because the odds call is now try_once on the
+ *                     backend, so total wall time is ~2 s without odds or
+ *                     ~3 s with a live odds hit.
+ * SIM_TIMEOUT_MS    : 30 s — individual game deep-sim (50 k paths).
+ * DEFAULT_TIMEOUT_MS: 10 s — everything else.
  */
 import axios from 'axios'
 import type {
@@ -12,12 +21,20 @@ import type {
   BacktestData,
 } from './types'
 
-const client = axios.create({ baseURL: '/' })
+const DAILY_TIMEOUT_MS  = 25_000
+const SIM_TIMEOUT_MS    = 30_000
+const DEFAULT_TIMEOUT_MS = 10_000
+
+const client = axios.create({
+  baseURL: '/',
+  timeout: DEFAULT_TIMEOUT_MS,
+})
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
 function apiError(err: unknown): never {
   if (axios.isAxiosError(err)) {
+    if (err.code === 'ECONNABORTED') throw new Error('Request timed out — is the API server running?')
     const detail = (err.response?.data as { detail?: string })?.detail
     throw new Error(detail ?? err.message)
   }
@@ -26,13 +43,18 @@ function apiError(err: unknown): never {
 
 // ── endpoints ──────────────────────────────────────────────────────────────
 
+/**
+ * Fetch today's (or a specific date's) slate of games with simulation data.
+ * Uses n_sims=5000 on the initial load for speed; user can re-run with more.
+ */
 export async function fetchDailyPredictions(
   date?: string,
-  nSims = 20_000,
+  nSims = 5_000,
 ): Promise<Envelope<DailyGame[]>> {
   try {
     const { data } = await client.get<Envelope<DailyGame[]>>('/api/predictions/daily', {
       params: { n_sims: nSims, ...(date ? { date } : {}) },
+      timeout: DAILY_TIMEOUT_MS,
     })
     return data
   } catch (e) {
@@ -49,11 +71,12 @@ export async function fetchGameSimulation(
       `/api/games/${gameId}/simulation`,
       {
         params: {
-          n_sims: opts.nSims ?? 50_000,
+          n_sims: opts.nSims ?? 20_000,
           ...(opts.totalLine !== undefined ? { total_line: opts.totalLine } : {}),
           ...(opts.runLine  !== undefined ? { run_line:   opts.runLine  } : {}),
           ...(opts.bins     !== undefined ? { bins:       opts.bins     } : {}),
         },
+        timeout: SIM_TIMEOUT_MS,
       },
     )
     return data
@@ -66,7 +89,7 @@ export async function fetchSGP(
   gameId: number,
   legs: SGPLeg[],
   bankroll = 1000,
-  nSims = 20_000,
+  nSims = 10_000,
 ): Promise<Envelope<SGPData>> {
   try {
     const { data } = await client.post<Envelope<SGPData>>('/api/predictions/sgp', {
@@ -83,7 +106,9 @@ export async function fetchSGP(
 
 export async function fetchBacktestReport(): Promise<Envelope<BacktestData>> {
   try {
-    const { data } = await client.get<Envelope<BacktestData>>('/api/backtest/report')
+    const { data } = await client.get<Envelope<BacktestData>>('/api/backtest/report', {
+      timeout: DEFAULT_TIMEOUT_MS,
+    })
     return data
   } catch (e) {
     return apiError(e)

@@ -184,7 +184,7 @@ async def recommendations_today(
         raise HTTPException(status_code=503, detail="ODDS_API_KEY not configured")
 
     try:
-        raw_odds = get_game_odds(markets=("h2h",))
+        raw_odds = get_game_odds(markets=("h2h",), try_once=True)
         # Convert list[GameOdds] → flat DataFrame shape _index_odds_by_home expects
         import pandas as pd  # noqa: PLC0415
         odds_rows = []
@@ -462,7 +462,7 @@ async def api_daily_predictions(
         try:
             from src.ingestion.live_odds import get_game_odds    # noqa: PLC0415
             import pandas as _pd                                  # noqa: PLC0415
-            raw_odds_list = get_game_odds(markets=("h2h",))
+            raw_odds_list = get_game_odds(markets=("h2h",), try_once=True)
             _odds_rows: list[dict] = []
             for _go in raw_odds_list:
                 if _go.get("market") != "h2h":

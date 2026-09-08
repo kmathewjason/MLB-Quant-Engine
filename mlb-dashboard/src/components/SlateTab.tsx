@@ -89,7 +89,7 @@ export default function SlateTab() {
 
   const load = () => {
     setLoading(true); setError(null)
-    fetchDailyPredictions(date || undefined, 10_000)
+    fetchDailyPredictions(date || undefined)
       .then(env => setGames(env.data))
       .catch(e => setError(String(e)))
       .finally(() => setLoading(false))
