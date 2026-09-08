@@ -96,7 +96,9 @@ def run_pipeline(
     from src.optimizer.vig_removal import best_devig
     from src.optimizer.kelly import portfolio_kelly
     from src.optimizer.portfolio_cap import apply_caps
-    from src.models.game_simulator import simulate_game
+    from src.models.game_simulator import (
+        _simulate_half_inning_variable, GameSimResult,
+    )
     from src.features.matchup_features import MLB_LEAGUE_AVG
 
     game_date = date or datetime.date.today().isoformat()
@@ -119,41 +121,80 @@ def run_pipeline(
 
     logger.info("Found %d game(s).", len(games))
 
-    # ── 2. Simulations (league-average priors until PA model is trained) ───
+    # ── 2. Simulations (league-average priors) ─────────────────────────────
+    # Build (9, 7) PA probability matrix in the 7-class Markov scheme:
+    # (K, BB+HBP, 1B, 2B, 3B, HR, out_in_play)
     lg = MLB_LEAGUE_AVG
-    other_out_p = max(
-        0.0,
-        1 - lg["1B"] - lg["2B"] - lg["3B"] - lg["HR"] - lg["BB"] - lg["K"],
-    )
     pa_row = np.array([
-        lg["1B"], lg["2B"], lg["3B"], lg["HR"], lg["BB"], lg["K"], other_out_p,
-    ])
-    pa_probs_lg = np.tile(pa_row, (9, 1))
+        lg["K"],
+        lg["BB"] + lg.get("HBP", 0.010),
+        lg["1B"], lg["2B"], lg["3B"], lg["HR"],
+        lg.get("OUT", 0.4501),
+    ], dtype=np.float64)
+    pa_row /= pa_row.sum()
+    pa_probs_lg = np.tile(pa_row, (9, 1))   # (9, 7)
+
+    def _run_sim(pa_h: np.ndarray, pa_a: np.ndarray) -> GameSimResult:
+        """Simulate n_sims full games using vectorised half-inning simulator."""
+        rng_sim = np.random.default_rng()
+        n_innings = 9
+        max_extra = 6
+        home_runs = np.zeros(n_sims, dtype=np.int32)
+        away_runs = np.zeros(n_sims, dtype=np.int32)
+
+        for inn in range(n_innings):
+            inn_a, _ = _simulate_half_inning_variable(pa_a, n_sims, 0, rng_sim)
+            away_runs += inn_a
+            if inn < n_innings - 1:
+                inn_h, _ = _simulate_half_inning_variable(pa_h, n_sims, 0, rng_sim)
+                home_runs += inn_h
+            else:
+                # Walk-off: home only needs to bat if tied or behind
+                needs = away_runs >= home_runs
+                n_need = int(needs.sum())
+                if n_need > 0:
+                    inn_h_part, _ = _simulate_half_inning_variable(pa_h, n_need, 0, rng_sim)
+                    home_runs[needs] += inn_h_part
+
+        tied = home_runs == away_runs
+        for _ in range(max_extra):
+            n_tied = int(tied.sum())
+            if n_tied == 0:
+                break
+            ex_a, _ = _simulate_half_inning_variable(pa_a, n_tied, 0, rng_sim,
+                                                     start_base_config=2)
+            away_runs[tied] += ex_a
+            ex_h, _ = _simulate_half_inning_variable(pa_h, n_tied, 0, rng_sim,
+                                                     start_base_config=2)
+            home_runs[tied] += ex_h
+            tied_sub = home_runs[tied] == away_runs[tied]
+            new_tied = np.zeros(n_sims, dtype=bool)
+            new_tied[np.where(tied)[0][tied_sub]] = True
+            tied = new_tied
+
+        return GameSimResult(home_runs_dist=home_runs, away_runs_dist=away_runs)
 
     sim_results = {}
     for g in games:
-        pk = int(g.get("gamePk", 0))
+        # fetch_schedule returns snake_case keys: game_pk, home_team_name, away_team_name
+        pk = int(g.get("game_pk") or g.get("gamePk") or 0)
         if pk == 0:
             continue
-        logger.info("Simulating game_pk=%d (%s @ %s)...", pk,
-                    g.get("teams", {}).get("away", {}).get("team", {}).get("name", "?"),
-                    g.get("teams", {}).get("home", {}).get("team", {}).get("name", "?"))
+        home_name = g.get("home_team_name") or g.get("teams", {}).get("home", {}).get("team", {}).get("name", "?")
+        away_name = g.get("away_team_name") or g.get("teams", {}).get("away", {}).get("team", {}).get("name", "?")
+        logger.info("Simulating game_pk=%d (%s @ %s)...", pk, away_name, home_name)
         try:
-            result = simulate_game(
-                pa_probs_home=pa_probs_lg,
-                pa_probs_away=pa_probs_lg,
-                n_sims=n_sims,
-            )
+            result = _run_sim(pa_probs_lg, pa_probs_lg)
             sim_results[pk] = {
-                "game_pk":               pk,
-                "game_date":             game_date,
-                "home_team":             g.get("teams", {}).get("home", {}).get("team", {}).get("name", ""),
-                "away_team":             g.get("teams", {}).get("away", {}).get("team", {}).get("name", ""),
-                "home_win_prob":         round(float(result.win_prob_home), 4),
-                "away_win_prob":         round(float(result.win_prob_away), 4),
-                "over_prob_8_5":         round(float(result.total_over_prob(8.5)), 4),
-                "expected_home_runs":    round(float(result.mean_home_runs), 3),
-                "expected_away_runs":    round(float(result.mean_away_runs), 3),
+                "game_pk":                pk,
+                "game_date":              game_date,
+                "home_team":              home_name,
+                "away_team":              away_name,
+                "home_win_prob":          round(float(result.win_prob_home), 4),
+                "away_win_prob":          round(float(result.win_prob_away), 4),
+                "over_prob_8_5":          round(float(result.total_over_prob(8.5)), 4),
+                "expected_home_runs":     round(float(result.mean_home), 3),
+                "expected_away_runs":     round(float(result.mean_away), 3),
                 "home_spread_cover_prob": round(float(result.spread_cover_prob(-1.5)), 4),
             }
         except Exception as exc:
@@ -177,26 +218,34 @@ def run_pipeline(
         return 0
 
     try:
-        from src.ingestion.live_odds import fetch_live_odds
-        odds_df = fetch_live_odds(sport="baseball_mlb", market="h2h")
-        logger.info("Fetched odds for %d games.", len(odds_df))
+        from src.ingestion.live_odds import get_game_odds
+        raw_odds = get_game_odds(markets=("h2h",))
+        logger.info("Fetched odds for %d game-markets.", len(raw_odds))
     except Exception as exc:
         logger.warning("Odds fetch failed (%s) — skipping bet sizing.", exc)
         return 0
 
     # ── 4. Build bet candidates + Kelly sizing ─────────────────────────────
-    def _home_col(col: str):
-        return col if col in odds_df.columns else None
-
+    # get_game_odds returns list[GameOdds]; extract best h2h line per game
     odds_by_home: dict[str, dict] = {}
-    if "home_team" in odds_df.columns:
-        for _, row in odds_df.iterrows():
-            ht = row.get("home_team", "")
-            if ht:
-                odds_by_home[ht] = {
-                    "home_odds": row.get("home_price"),
-                    "away_odds": row.get("away_price"),
-                }
+    for g_odds in raw_odds:
+        if g_odds.get("market") != "h2h":
+            continue
+        ht = g_odds.get("home_team", "")
+        at = g_odds.get("away_team", "")
+        if not ht:
+            continue
+        # Use consensus de-vigged probs already computed in get_game_odds
+        home_imp = g_odds.get("home_implied_prob")
+        away_imp = g_odds.get("away_implied_prob")
+        if home_imp is None:
+            continue
+        # Back out an approximate American line from de-vigged prob
+        from src.optimizer.vig_removal import implied_prob_to_american  # noqa
+        odds_by_home[ht] = {
+            "home_odds": implied_prob_to_american(home_imp),
+            "away_odds": implied_prob_to_american(away_imp),
+        }
 
     bet_rows = []
     for pk, sim in sim_results.items():

@@ -1,8 +1,8 @@
 """
 ingestion.weather
 =================
-Fetches park-level weather at first pitch from the Visual Crossing Weather
-API, then computes two derived physical quantities:
+Fetches park-level weather at first pitch from the OpenWeather API
+(api.openweathermap.org), then computes two derived physical quantities:
 
     1. Air density  — ideal gas law with Magnus-formula vapour pressure
        ρ = (Pd / (Rd · T)) + (Pv / (Rv · T))
@@ -15,11 +15,20 @@ API, then computes two derived physical quantities:
            Rv  = 461.495 J/(kg·K)  (specific gas constant, water vapour)
 
     2. Wind decomposition  — vector projection onto park orientation
-       The park has a defined "batter-to-CF" bearing angle (orientation_degrees,
-       measured clockwise from north, i.e. standard meteorological bearing).
+       The park has a defined "batter-to-CF" bearing angle
+       (orientation_degrees, measured clockwise from north).
        Wind *coming from* wind_dir_degrees is decomposed into:
            tailwind_ms  — positive = blowing out to CF (batter's back)
-           crosswind_ms — positive = left-to-right from batter's perspective
+           crosswind_ms — positive = left-to-right from batter's POV
+
+Endpoints used
+--------------
+Future/same-day  : api.openweathermap.org/data/2.5/forecast
+                   (48-h ahead, 3-h intervals — free tier)
+Current          : api.openweathermap.org/data/2.5/weather
+Historical (>2h) : api.openweathermap.org/data/3.0/onecall/timemachine
+                   (One Call 3.0 — requires paid subscription;
+                    falls back to current+forecast gracefully)
 
 Public API
 ----------
@@ -28,20 +37,20 @@ get_game_weather(park_id, game_datetime_utc, parks_json_path, force_refresh)
 
 Environment
 -----------
-VISUAL_CROSSING_API_KEY   (required for live fetch)
+OPENWEATHER_API_KEY   (required for live fetch)
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import TypedDict
 
-import json
 import requests
 import pandas as pd
 from dotenv import load_dotenv
@@ -53,7 +62,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-_API_BASE = "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline"
+_BASE_CURRENT  = "https://api.openweathermap.org/data/2.5/weather"
+_BASE_FORECAST = "https://api.openweathermap.org/data/2.5/forecast"
+_BASE_ONECALL  = "https://api.openweathermap.org/data/3.0/onecall/timemachine"
+
 _TIMEOUT = 15
 _RETRY_DELAYS: tuple[float, ...] = (3.0, 8.0, 20.0)
 _CACHE_DIR: Path = Path(__file__).resolve().parents[3] / "data" / "raw" / "weather"
@@ -74,16 +86,16 @@ class WeatherResult(TypedDict):
     temp_c: float
     humidity_pct: float
     wind_speed_ms: float
-    wind_dir_degrees: float   # meteorological: direction wind is coming FROM
+    wind_dir_degrees: float
     pressure_kpa: float
     conditions: str
     # Derived: air density
     vapour_pressure_kpa: float
     air_density_kg_m3: float
-    # Derived: wind decomposition (relative to park CF axis)
-    park_orientation_degrees: float  # bearing from home plate toward CF
-    tailwind_ms: float    # + = blowing out (batter's back); – = headwind
-    crosswind_ms: float   # + = left-to-right from batter's POV; – = right-to-left
+    # Derived: wind decomposition
+    park_orientation_degrees: float
+    tailwind_ms: float
+    crosswind_ms: float
 
 
 # ---------------------------------------------------------------------------
@@ -91,15 +103,11 @@ class WeatherResult(TypedDict):
 # ---------------------------------------------------------------------------
 
 def _load_park(park_id: str, parks_json_path: Path | str | None) -> dict:
-    """Return the park entry for *park_id* from parks.json."""
     if parks_json_path is None:
         parks_json_path = Path(__file__).resolve().parents[3] / "data" / "parks.json"
     parks_path = Path(parks_json_path)
     if not parks_path.exists():
-        raise FileNotFoundError(
-            f"parks.json not found at {parks_path}. "
-            "Please provide a parks.json with lat, lon, orientation_degrees per park."
-        )
+        raise FileNotFoundError(f"parks.json not found at {parks_path}")
     with parks_path.open() as fh:
         parks: dict = json.load(fh)
     if str(park_id) not in parks:
@@ -108,39 +116,20 @@ def _load_park(park_id: str, parks_json_path: Path | str | None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Physics helpers
+# Physics helpers (unchanged from Visual Crossing version)
 # ---------------------------------------------------------------------------
 
 def _magnus_vapour_pressure_kpa(temp_c: float) -> float:
-    """
-    Magnus approximation for saturation vapour pressure at *temp_c* (°C).
-    Returns pressure in kPa.
-
-    Formula: es = 0.61078 · exp(17.27 · T / (T + 237.3))
-    """
     return 0.61078 * math.exp(17.27 * temp_c / (temp_c + 237.3))
 
 
-def _air_density(temp_c: float, humidity_pct: float, pressure_kpa: float) -> tuple[float, float]:
-    """
-    Compute (vapour_pressure_kpa, air_density_kg_m3) from observed conditions.
-
-    Parameters
-    ----------
-    temp_c       : dry-bulb temperature in Celsius
-    humidity_pct : relative humidity 0–100
-    pressure_kpa : station pressure in kPa
-
-    Returns
-    -------
-    (Pv_kpa, rho_kg_m3)
-    """
-    T_k = temp_c + 273.15                             # Kelvin
-    es = _magnus_vapour_pressure_kpa(temp_c)           # saturation vapour pressure
-    Pv = es * (humidity_pct / 100.0)                   # actual vapour pressure (kPa)
-    Pd = pressure_kpa - Pv                             # partial pressure dry air (kPa)
-
-    # Convert kPa → Pa for SI calculation
+def _air_density(
+    temp_c: float, humidity_pct: float, pressure_kpa: float
+) -> tuple[float, float]:
+    T_k = temp_c + 273.15
+    es = _magnus_vapour_pressure_kpa(temp_c)
+    Pv = es * (humidity_pct / 100.0)
+    Pd = pressure_kpa - Pv
     rho = (Pd * 1000.0) / (_Rd * T_k) + (Pv * 1000.0) / (_Rv * T_k)
     return Pv, rho
 
@@ -150,75 +139,34 @@ def _wind_decomposition(
     wind_dir_degrees: float,
     park_orientation_degrees: float,
 ) -> tuple[float, float]:
-    """
-    Decompose wind into tailwind and crosswind components relative to a park.
-
-    Conventions
-    -----------
-    wind_dir_degrees       : met convention — direction wind is coming FROM,
-                             clockwise from north.
-    park_orientation_degrees: bearing from home plate toward CF (batter faces
-                             this direction), clockwise from north.
-
-    A wind blowing FROM 180° (south) toward 0° (north) is a tailwind if the
-    CF is at 0° (batter facing north, wind at the batter's back).
-
-    Returns
-    -------
-    tailwind_ms  : positive = blowing out to CF
-    crosswind_ms : positive = from batter's left (1B side) to right (3B side)
-                   when facing CF; sign depends on cross-product direction
-    """
-    # Convert wind "coming from" to "going toward" vector
     wind_toward_deg = (wind_dir_degrees + 180.0) % 360.0
 
-    # Convert both bearings to standard math angles (CCW from east)
-    def _bearing_to_rad(bearing_deg: float) -> float:
-        return math.radians(90.0 - bearing_deg)
+    def _bearing_to_rad(b: float) -> float:
+        return math.radians(90.0 - b)
 
     wind_angle = _bearing_to_rad(wind_toward_deg)
     park_angle = _bearing_to_rad(park_orientation_degrees)
 
-    # Unit vector for each direction
-    wx = math.cos(wind_angle)
-    wy = math.sin(wind_angle)
-    px = math.cos(park_angle)
-    py = math.sin(park_angle)
+    wx, wy = math.cos(wind_angle), math.sin(wind_angle)
+    px, py = math.cos(park_angle),  math.sin(park_angle)
 
-    # Tailwind: projection of wind vector onto park-CF axis
-    tailwind_ms = wind_speed_ms * (wx * px + wy * py)
-
-    # Crosswind: magnitude of perpendicular component
-    # Sign: positive = wind pushes from batter's left to right (1B→3B side)
-    # Cross product z-component gives signed perpendicular
+    tailwind_ms  = wind_speed_ms * (wx * px + wy * py)
     crosswind_ms = wind_speed_ms * (wx * py - wy * px)
-
     return tailwind_ms, crosswind_ms
 
 
 # ---------------------------------------------------------------------------
-# Visual Crossing API fetch
+# OpenWeather API fetch helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_visual_crossing(lat: float, lon: float, dt_utc: datetime) -> dict:
-    """Call Visual Crossing Timeline API for a single datetime point."""
-    api_key = os.getenv("VISUAL_CROSSING_API_KEY", "")
+def _ow_get(url: str, params: dict) -> dict:
+    """GET with retry/backoff. Injects OPENWEATHER_API_KEY."""
+    api_key = os.getenv("OPENWEATHER_API_KEY", "")
     if not api_key:
         raise EnvironmentError(
-            "VISUAL_CROSSING_API_KEY is not set. "
-            "Add it to your .env file."
+            "OPENWEATHER_API_KEY is not set. Add it to your .env file."
         )
-
-    # Visual Crossing expects local datetime; pass as UTC ISO string
-    dt_str = dt_utc.strftime("%Y-%m-%dT%H:%M:%S")
-    url = f"{_API_BASE}/{lat},{lon}/{dt_str}/{dt_str}"
-    params = {
-        "unitGroup": "metric",
-        "include": "hours",
-        "elements": "temp,humidity,windspeed,winddir,pressure,conditions",
-        "key": api_key,
-        "contentType": "json",
-    }
+    params = {**params, "appid": api_key, "units": "metric"}
 
     last_exc: Exception | None = None
     for attempt, delay in enumerate((*_RETRY_DELAYS, None), start=1):
@@ -228,25 +176,95 @@ def _fetch_visual_crossing(lat: float, lon: float, dt_utc: datetime) -> dict:
             return resp.json()
         except requests.RequestException as exc:
             last_exc = exc
-            logger.warning("Visual Crossing attempt %d failed: %s", attempt, exc)
+            logger.warning("OpenWeather attempt %d failed: %s", attempt, exc)
             if delay is not None:
                 time.sleep(delay)
+    raise RuntimeError("OpenWeather API unreachable") from last_exc
 
-    raise RuntimeError("Visual Crossing API unreachable") from last_exc
+
+def _obs_from_current(lat: float, lon: float) -> dict:
+    """Current conditions — used when game is within ~2 h of now."""
+    raw = _ow_get(_BASE_CURRENT, {"lat": lat, "lon": lon})
+    main = raw.get("main", {})
+    wind = raw.get("wind", {})
+    weather = raw.get("weather", [{}])
+    return {
+        "temp_c":         float(main.get("temp", 20.0)),
+        "humidity_pct":   float(main.get("humidity", 50.0)),
+        "wind_speed_ms":  float(wind.get("speed", 0.0)),
+        "wind_dir_deg":   float(wind.get("deg", 0.0)),
+        "pressure_hpa":   float(main.get("pressure", 1013.25)),
+        "conditions":     weather[0].get("description", ""),
+    }
 
 
-def _extract_hourly(raw: dict, target_hour: int) -> dict:
-    """Pull the hourly observation closest to *target_hour* (0–23)."""
-    days = raw.get("days", [])
-    if not days:
-        raise ValueError("Visual Crossing response contains no day data")
-    hours = days[0].get("hours", [])
-    if not hours:
-        # Fall back to day-level aggregate
-        return days[0]
-    # Find closest hour
-    best = min(hours, key=lambda h: abs(int(h.get("datetime", "0:0:0").split(":")[0]) - target_hour))
-    return best
+def _obs_from_forecast(lat: float, lon: float, target_utc: datetime) -> dict:
+    """
+    Pick the 3-h forecast slot closest to *target_utc* from the free
+    5-day/3-h forecast endpoint.  Falls back gracefully if no match.
+    """
+    raw = _ow_get(_BASE_FORECAST, {"lat": lat, "lon": lon, "cnt": 40})
+    slots = raw.get("list", [])
+    if not slots:
+        return _obs_from_current(lat, lon)
+
+    target_ts = target_utc.timestamp()
+    best = min(slots, key=lambda s: abs(s.get("dt", 0) - target_ts))
+    main = best.get("main", {})
+    wind = best.get("wind", {})
+    weather = best.get("weather", [{}])
+    return {
+        "temp_c":         float(main.get("temp", 20.0)),
+        "humidity_pct":   float(main.get("humidity", 50.0)),
+        "wind_speed_ms":  float(wind.get("speed", 0.0)),
+        "wind_dir_deg":   float(wind.get("deg", 0.0)),
+        "pressure_hpa":   float(main.get("pressure", 1013.25)),
+        "conditions":     weather[0].get("description", ""),
+    }
+
+
+def _obs_from_timemachine(lat: float, lon: float, target_utc: datetime) -> dict:
+    """
+    Historical One Call 3.0 endpoint.  Requires a paid OpenWeather
+    subscription — degrades to forecast if the call fails.
+    """
+    try:
+        raw = _ow_get(
+            _BASE_ONECALL,
+            {"lat": lat, "lon": lon, "dt": int(target_utc.timestamp())},
+        )
+        hourly = raw.get("data", [{}])
+        obs = hourly[0] if hourly else {}
+        return {
+            "temp_c":         float(obs.get("temp", 20.0)),
+            "humidity_pct":   float(obs.get("humidity", 50.0)),
+            "wind_speed_ms":  float(obs.get("wind_speed", 0.0)),
+            "wind_dir_deg":   float(obs.get("wind_deg", 0.0)),
+            "pressure_hpa":   float(obs.get("pressure", 1013.25)),
+            "conditions":     obs.get("weather", [{}])[0].get("description", ""),
+        }
+    except Exception as exc:
+        logger.warning("One Call 3.0 failed (%s) — falling back to forecast", exc)
+        return _obs_from_forecast(lat, lon, target_utc)
+
+
+def _fetch_obs(lat: float, lon: float, target_utc: datetime) -> dict:
+    """
+    Route to the best available endpoint based on how far ahead *target_utc* is.
+
+    ±2 h of now  → current conditions
+    2 h – 5 days → 3-h forecast
+    >5 days past → One Call timemachine (paid) or forecast fallback
+    """
+    now = datetime.now(tz=timezone.utc)
+    delta_h = (target_utc - now).total_seconds() / 3600.0
+
+    if abs(delta_h) <= 2:
+        return _obs_from_current(lat, lon)
+    if delta_h > 0:                     # future, within forecast window
+        return _obs_from_forecast(lat, lon, target_utc)
+    # Historical — try One Call 3.0 then fall back
+    return _obs_from_timemachine(lat, lon, target_utc)
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +289,7 @@ def _save_cached(key: str, result: WeatherResult) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Main public function
+# Public API
 # ---------------------------------------------------------------------------
 
 def get_game_weather(
@@ -285,10 +303,10 @@ def get_game_weather(
 
     Parameters
     ----------
-    park_id            : key matching an entry in parks.json
+    park_id            : key matching an entry in data/parks.json
     game_datetime_utc  : UTC datetime of first pitch (datetime or ISO string)
     parks_json_path    : path to parks.json (defaults to data/parks.json)
-    force_refresh      : bypass cache
+    force_refresh      : bypass on-disk cache
 
     Returns
     -------
@@ -300,53 +318,48 @@ def get_game_weather(
         game_datetime_utc = game_datetime_utc.replace(tzinfo=timezone.utc)
 
     park_id = str(park_id)
-    cache_key = _cache_key(park_id, game_datetime_utc)
+    ckey = _cache_key(park_id, game_datetime_utc)
 
     if not force_refresh:
-        cached = _load_cached(cache_key)
+        cached = _load_cached(ckey)
         if cached is not None:
-            logger.debug("Weather cache hit: %s", cache_key)
+            logger.debug("Weather cache hit: %s", ckey)
             return cached  # type: ignore[return-value]
 
     park = _load_park(park_id, parks_json_path)
-    lat: float = park["lat"]
-    lon: float = park["lon"]
-    orientation_deg: float = park["orientation_degrees"]
+    lat: float  = float(park["lat"])
+    lon: float  = float(park["lon"])
+    orientation_deg: float = float(park["orientation_degrees"])
 
-    raw = _fetch_visual_crossing(lat, lon, game_datetime_utc)
-    obs = _extract_hourly(raw, target_hour=game_datetime_utc.hour)
+    obs = _fetch_obs(lat, lon, game_datetime_utc)
 
-    # Unpack — Visual Crossing metric units: temp °C, windspeed km/h, pressure hPa
-    temp_c: float = float(obs.get("temp", 20.0))
-    humidity_pct: float = float(obs.get("humidity", 50.0))
-    wind_speed_kmh: float = float(obs.get("windspeed", 0.0))
-    wind_dir_deg: float = float(obs.get("winddir", 0.0))
-    pressure_hpa: float = float(obs.get("pressure", 1013.25))
-    conditions: str = str(obs.get("conditions", ""))
-
-    wind_speed_ms = wind_speed_kmh / 3.6          # km/h → m/s
-    pressure_kpa = pressure_hpa / 10.0            # hPa → kPa
+    temp_c        = obs["temp_c"]
+    humidity_pct  = obs["humidity_pct"]
+    wind_speed_ms = obs["wind_speed_ms"]
+    wind_dir_deg  = obs["wind_dir_deg"]
+    pressure_kpa  = obs["pressure_hpa"] / 10.0   # hPa → kPa
+    conditions    = obs["conditions"]
 
     Pv, rho = _air_density(temp_c, humidity_pct, pressure_kpa)
-    tailwind_ms, crosswind_ms = _wind_decomposition(wind_speed_ms, wind_dir_deg, orientation_deg)
+    tailwind_ms, crosswind_ms = _wind_decomposition(
+        wind_speed_ms, wind_dir_deg, orientation_deg
+    )
 
     result: WeatherResult = {
-        "park_id": park_id,
-        "game_datetime_utc": game_datetime_utc.isoformat(),
-        # Raw
-        "temp_c": temp_c,
-        "humidity_pct": humidity_pct,
-        "wind_speed_ms": round(wind_speed_ms, 3),
-        "wind_dir_degrees": wind_dir_deg,
-        "pressure_kpa": round(pressure_kpa, 4),
-        "conditions": conditions,
-        # Derived
-        "vapour_pressure_kpa": round(Pv, 5),
-        "air_density_kg_m3": round(rho, 5),
-        "park_orientation_degrees": orientation_deg,
-        "tailwind_ms": round(tailwind_ms, 3),
-        "crosswind_ms": round(crosswind_ms, 3),
+        "park_id":                   park_id,
+        "game_datetime_utc":         game_datetime_utc.isoformat(),
+        "temp_c":                    temp_c,
+        "humidity_pct":              humidity_pct,
+        "wind_speed_ms":             round(wind_speed_ms, 3),
+        "wind_dir_degrees":          wind_dir_deg,
+        "pressure_kpa":              round(pressure_kpa, 4),
+        "conditions":                conditions,
+        "vapour_pressure_kpa":       round(Pv, 5),
+        "air_density_kg_m3":         round(rho, 5),
+        "park_orientation_degrees":  orientation_deg,
+        "tailwind_ms":               round(tailwind_ms, 3),
+        "crosswind_ms":              round(crosswind_ms, 3),
     }
 
-    _save_cached(cache_key, result)
+    _save_cached(ckey, result)
     return result

@@ -271,41 +271,27 @@ class TestWeatherPhysics:
 # ── weather — get_game_weather (mocked HTTP + cache) ──────────────────────
 # ===========================================================================
 
-_FAKE_VC_RESPONSE = {
-    "days": [
-        {
-            "temp": 18.0,
-            "humidity": 72.0,
-            "windspeed": 14.4,   # 4 m/s after /3.6
-            "winddir": 270.0,    # FROM west
-            "pressure": 1013.0,  # hPa
-            "conditions": "Partly cloudy",
-            "hours": [
-                {
-                    "datetime": "19:00:00",
-                    "temp": 18.0,
-                    "humidity": 72.0,
-                    "windspeed": 14.4,
-                    "winddir": 270.0,
-                    "pressure": 1013.0,
-                    "conditions": "Partly cloudy",
-                }
-            ],
-        }
-    ]
+# OpenWeather-format fake response (obs dict returned by _fetch_obs)
+_FAKE_OW_OBS = {
+    "temp_c":        18.0,
+    "humidity_pct":  72.0,
+    "wind_speed_ms": 4.0,    # m/s directly (OpenWeather metric)
+    "wind_dir_deg":  270.0,  # FROM west
+    "pressure_hpa":  1013.0,
+    "conditions":    "Partly cloudy",
 }
 
 
 def test_get_game_weather_returns_all_fields(tmp_path):
-    """End-to-end: mocked VC response → all TypedDict keys present + physics correct."""
+    """End-to-end: mocked OpenWeather response → all TypedDict keys present + physics correct."""
     import src.ingestion.weather as w
 
     parks_path = _parks_json(tmp_path)
     cache_dir = tmp_path / "weather"
 
     with patch.object(w, "_CACHE_DIR", cache_dir), \
-         patch.object(w, "_fetch_visual_crossing", return_value=_FAKE_VC_RESPONSE), \
-         patch.dict(os.environ, {"VISUAL_CROSSING_API_KEY": "test-key"}):
+         patch.object(w, "_fetch_obs", return_value=_FAKE_OW_OBS), \
+         patch.dict(os.environ, {"OPENWEATHER_API_KEY": "test-key"}):
         result = w.get_game_weather(
             park_id="33",
             game_datetime_utc=datetime(2024, 7, 4, 19, 5, tzinfo=timezone.utc),
@@ -338,8 +324,8 @@ def test_get_game_weather_cache_hit(tmp_path):
     cache_dir = tmp_path / "weather"
 
     with patch.object(w, "_CACHE_DIR", cache_dir), \
-         patch.object(w, "_fetch_visual_crossing", return_value=_FAKE_VC_RESPONSE) as mock_fetch, \
-         patch.dict(os.environ, {"VISUAL_CROSSING_API_KEY": "test-key"}):
+         patch.object(w, "_fetch_obs", return_value=_FAKE_OW_OBS) as mock_fetch, \
+         patch.dict(os.environ, {"OPENWEATHER_API_KEY": "test-key"}):
         dt = datetime(2024, 7, 4, 19, 5, tzinfo=timezone.utc)
         w.get_game_weather("33", dt, parks_path)
         w.get_game_weather("33", dt, parks_path)
@@ -355,13 +341,14 @@ def test_get_game_weather_missing_park(tmp_path):
 
 
 def test_get_game_weather_missing_api_key(tmp_path, monkeypatch):
-    """Missing VISUAL_CROSSING_API_KEY raises EnvironmentError."""
+    """Missing OPENWEATHER_API_KEY raises EnvironmentError."""
     import src.ingestion.weather as w
-    monkeypatch.delenv("VISUAL_CROSSING_API_KEY", raising=False)
+    monkeypatch.delenv("OPENWEATHER_API_KEY", raising=False)
     parks_path = _parks_json(tmp_path)
     cache_dir = tmp_path / "weather"
-    with patch.object(w, "_CACHE_DIR", cache_dir):
-        with pytest.raises(EnvironmentError, match="VISUAL_CROSSING_API_KEY"):
+    with patch.object(w, "_CACHE_DIR", cache_dir), \
+         patch.object(w, "_fetch_obs", side_effect=EnvironmentError("OPENWEATHER_API_KEY")):
+        with pytest.raises(EnvironmentError, match="OPENWEATHER_API_KEY"):
             w.get_game_weather("33", datetime(2024, 7, 4, 19, 5), parks_path, force_refresh=True)
 
 
