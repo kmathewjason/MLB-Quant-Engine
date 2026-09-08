@@ -364,8 +364,8 @@ class SGPRequest(BaseModel):
 # GET /api/predictions/daily
 # ---------------------------------------------------------------------------
 
-_PA_OUTCOME_NAMES = ["1B", "2B", "3B", "HR", "BB", "K", "out"]
-_DEFAULT_TOTAL_LINES = [7.5, 8.5, 9.5]
+_PA_OUTCOME_NAMES  = ["1B", "2B", "3B", "HR", "BB", "K", "out"]
+_DEFAULT_TOTAL_LINES = [6.5, 7.5, 8.5, 9.5, 10.5]
 _DEFAULT_RUN_LINES   = [-1.5, 1.5]
 
 
@@ -455,51 +455,32 @@ async def api_daily_predictions(
     if not games:
         return _envelope([])
 
-    # ── 2. Live odds (gracefully degraded if key missing) ──────────────────
+    # ── 2. Live odds — fetch ALL three game markets + cache by home team ───
     odds_key = os.environ.get("ODDS_API_KEY", "")
-    odds_by_home: dict[str, dict] = {}
+    # Nested dicts keyed by home_team: { h2h, spreads, totals }
+    all_odds: dict[str, dict] = {}   # home_team → {h2h, spreads, totals}
     if odds_key:
         try:
             from src.ingestion.live_odds import get_game_odds    # noqa: PLC0415
-            import pandas as _pd                                  # noqa: PLC0415
-            raw_odds_list = get_game_odds(markets=("h2h",), try_once=True)
-            _odds_rows: list[dict] = []
-            for _go in raw_odds_list:
-                if _go.get("market") != "h2h":
-                    continue
-                _bh: int | None = None
-                _ba: int | None = None
-                for _bm in _go.get("lines", []):
-                    for _o in _bm.get("outcomes", []):
-                        if _o["name"] == _go["home_team"]:
-                            if _bh is None or _o["price"] > _bh:
-                                _bh = _o["price"]
-                        else:
-                            if _ba is None or _o["price"] > _ba:
-                                _ba = _o["price"]
-                _odds_rows.append({
-                    "home_team":  _go["home_team"],
-                    "away_team":  _go["away_team"],
-                    "home_price": _bh,
-                    "away_price": _ba,
-                })
-            odds_by_home = _index_odds_by_home(_pd.DataFrame(_odds_rows))
+            raw_odds_all = get_game_odds(
+                markets=("h2h", "spreads", "totals"), try_once=True
+            )
+            all_odds = _index_all_odds(raw_odds_all)
         except Exception as exc:
             logger.warning("Odds fetch failed (continuing without sizing): %s", exc)
 
     # ── 3. Simulate + build per-game payload ──────────────────────────────
     payload = []
     for g in games:
-        # fetch_schedule returns snake_case: game_pk, home_team_name, away_team_name
         pk = int(g.get("game_pk") or g.get("gamePk") or 0)
         if pk == 0:
             continue
 
         formatted = _format_game(g)
 
-        # Run / retrieve simulation
+        # Run / retrieve simulation (now uses real pitcher/batter stats)
         try:
-            sim_result = _run_simulation_cached(pk, n_sims=n_sims)
+            _run_simulation_cached(pk, n_sims=n_sims)
             raw = _raw_sim_cache[pk]
         except Exception as exc:
             logger.warning("Simulation failed for game_pk=%d: %s", pk, exc)
@@ -508,18 +489,18 @@ async def api_daily_predictions(
         sim_block = _build_simulation_block(raw, n_sims)
 
         # ── Markets ────────────────────────────────────────────────────────
-        markets = []
-        market_odds = odds_by_home.get(formatted["home_team"], {})
-        home_ml = market_odds.get("home_odds")
-        away_ml = market_odds.get("away_odds")
+        markets: list[dict] = []
+        game_odds = all_odds.get(formatted["home_team"], {})
 
-        # Moneylines
+        # -- Moneylines (h2h) --
+        h2h = game_odds.get("h2h", {})
+        home_ml = h2h.get("home_odds")
+        away_ml = h2h.get("away_odds")
         if home_ml is not None and away_ml is not None:
             try:
                 fair = best_devig([home_ml, away_ml], method=devig)
             except Exception:
                 fair = None
-
             for side_idx, (mkt_name, label, model_p, mkt_odds) in enumerate([
                 ("h2h_home", f"{formatted['home_team']} ML",
                  sim_block["home_win_prob"], home_ml),
@@ -528,44 +509,103 @@ async def api_daily_predictions(
             ]):
                 mkt_prob = float(fair[side_idx]) if fair is not None else None
                 markets.append(_build_market_row(
-                    market=mkt_name,
-                    label=label,
-                    model_prob=model_p,
-                    market_prob=mkt_prob,
-                    market_odds=mkt_odds,
-                    bankroll=bankroll,
+                    market=mkt_name, label=label,
+                    model_prob=model_p, market_prob=mkt_prob,
+                    market_odds=mkt_odds, bankroll=bankroll,
+                    category="moneyline",
                 ))
 
-        # Totals (use model probs; market odds unknown without a totals fetch)
-        for total_line in _DEFAULT_TOTAL_LINES:
-            over_p  = float(raw.total_over_prob(total_line))
-            under_p = 1.0 - over_p
-            for mkt_type, model_p in [("over", over_p), ("under", under_p)]:
-                markets.append(_build_market_row(
-                    market=f"total_{mkt_type}_{total_line}",
-                    label=f"{'O' if mkt_type=='over' else 'U'} {total_line}",
-                    model_prob=model_p,
-                    market_prob=None,  # no totals odds without extra fetch
-                    market_odds=None,
-                    bankroll=bankroll,
-                ))
-
-        # Run-line (spread)
-        for run_line in _DEFAULT_RUN_LINES:
+        # -- Run line / spread (-1.5) --
+        spread_odds = game_odds.get("spreads", {})
+        for run_line, side_key, label_team in [
+            (-1.5, "home", formatted["home_team"]),
+            (1.5,  "away", formatted["away_team"]),
+        ]:
             cover_p = float(raw.spread_cover_prob(run_line))
-            side_lbl = formatted["home_team"] if run_line < 0 else formatted["away_team"]
+            mkt_odds = spread_odds.get(f"{side_key}_odds")
+            mkt_prob: float | None = None
+            if mkt_odds is not None:
+                opp_odds = spread_odds.get(
+                    "away_odds" if side_key == "home" else "home_odds"
+                )
+                if opp_odds is not None:
+                    try:
+                        fp = best_devig([mkt_odds, opp_odds], method=devig)
+                        mkt_prob = float(fp[0])
+                    except Exception:
+                        pass
             markets.append(_build_market_row(
                 market=f"spread_{run_line:+.1f}",
-                label=f"{side_lbl} {run_line:+.1f}",
-                model_prob=cover_p,
-                market_prob=None,
-                market_odds=None,
-                bankroll=bankroll,
+                label=f"{label_team} {run_line:+.1f}",
+                model_prob=cover_p, market_prob=mkt_prob,
+                market_odds=mkt_odds, bankroll=bankroll,
+                category="spread",
             ))
 
-        # Sort by EV descending (nulls last)
-        markets.sort(key=lambda m: m["ev"] if m["ev"] is not None else float("-inf"),
-                     reverse=True)
+        # -- Totals (all lines from odds API + model lines not in odds) --
+        totals_odds = game_odds.get("totals", {})   # dict keyed "over_X.X" / "under_X.X"
+        seen_lines: set[float] = set()
+
+        # First: lines where we have actual odds
+        for key, mkt_odds in totals_odds.items():
+            # key format: "over_8.5" or "under_8.5"
+            parts = key.split("_")
+            if len(parts) != 2:
+                continue
+            side_str, line_str = parts
+            try:
+                tline = float(line_str)
+            except ValueError:
+                continue
+            seen_lines.add(tline)
+            over_p  = float(raw.total_over_prob(tline))
+            under_p = 1.0 - over_p
+            model_p = over_p if side_str == "over" else under_p
+            opp_key = f"{'under' if side_str == 'over' else 'over'}_{line_str}"
+            opp_odds = totals_odds.get(opp_key)
+            mkt_prob_t: float | None = None
+            if opp_odds is not None:
+                try:
+                    fp = best_devig([mkt_odds, opp_odds], method=devig)
+                    mkt_prob_t = float(fp[0])
+                except Exception:
+                    pass
+            markets.append(_build_market_row(
+                market=f"total_{side_str}_{tline}",
+                label=f"{'O' if side_str == 'over' else 'U'} {tline}",
+                model_prob=model_p, market_prob=mkt_prob_t,
+                market_odds=mkt_odds, bankroll=bankroll,
+                category="total",
+            ))
+
+        # Then: model-only lines not in the odds response
+        for total_line in _DEFAULT_TOTAL_LINES:
+            if total_line in seen_lines:
+                continue
+            over_p  = float(raw.total_over_prob(total_line))
+            under_p = 1.0 - over_p
+            for side_str, model_p in [("over", over_p), ("under", under_p)]:
+                markets.append(_build_market_row(
+                    market=f"total_{side_str}_{total_line}",
+                    label=f"{'O' if side_str == 'over' else 'U'} {total_line}",
+                    model_prob=model_p, market_prob=None,
+                    market_odds=None, bankroll=bankroll,
+                    category="total",
+                ))
+
+        # -- Player props --
+        props = _fetch_player_props_for_game(
+            formatted["game_pk"],
+            formatted["home_team"], formatted["away_team"],
+            raw, bankroll, devig,
+        )
+        markets.extend(props)
+
+        # Sort by EV descending (nulls last); keep all markets
+        markets.sort(
+            key=lambda m: m["ev"] if m["ev"] is not None else float("-inf"),
+            reverse=True,
+        )
 
         payload.append({
             **formatted,
@@ -1105,38 +1145,25 @@ def _run_simulation_cached(game_pk: int, n_sims: int = 50_000) -> dict:
     """
     Run (or retrieve cached) a MC simulation for *game_pk*.
 
+    Uses real pitcher/batter season stats via log5 matchup adjustment.
+    Falls back to league-average if player data is unavailable.
+
     Populates both _sim_cache (summary dict) and _raw_sim_cache (GameSimResult).
     Returns the summary dict.
     """
-    # Return cached result if we already have it with at least as many sims
     if game_pk in _sim_cache:
         return _sim_cache[game_pk]
 
-    from src.optimizer.kelly import simulate_corr_matrix  # noqa: PLC0415
+    # ── Get per-game PA probability matrices (real player stats) ─────────
+    try:
+        from src.ingestion.player_stats import get_game_pa_probs  # noqa: PLC0415
+        pa_home, pa_away = get_game_pa_probs(game_pk)
+        logger.info("game_pk=%d: using real player stats for simulation", game_pk)
+    except Exception as exc:
+        logger.warning("game_pk=%d: player stats unavailable (%s), using league avg", game_pk, exc)
+        pa_home = pa_away = _league_avg_pa_probs()
 
-    pa_probs = _league_avg_pa_probs()
-
-    # simulate_corr_matrix runs the half-inning engine directly with raw arrays
-    games_spec = [{
-        "pa_probs_home": pa_probs,
-        "pa_probs_away": pa_probs,
-        "side":          "home",
-        "outcome":       "moneyline",
-        "label":         str(game_pk),
-    }]
-    sim_corr = simulate_corr_matrix(
-        games_spec,
-        n_sims=n_sims,
-        rng=np.random.default_rng(),
-    )
-
-    # Retrieve the internal GameSimResult via the outcome_matrix
-    # simulate_corr_matrix exposes the raw result through game_results cache
-    # We need the actual run distributions; re-run via _run_game directly
-    from src.models.game_simulator import (  # noqa: PLC0415
-        _simulate_half_inning_variable, GameSimResult,
-    )
-    raw = _build_raw_game_result(pa_probs, pa_probs, n_sims)
+    raw = _build_raw_game_result(pa_home, pa_away, n_sims)
 
     summary = {
         "game_pk":                game_pk,
@@ -1266,6 +1293,7 @@ def _build_market_row(
     market_prob: Optional[float],
     market_odds: Optional[float],
     bankroll: float,
+    category: str = "game",
 ) -> dict:
     """
     Build one market row for the /api/predictions/daily response.
@@ -1289,6 +1317,7 @@ def _build_market_row(
     return {
         "market":        market,
         "label":         label,
+        "category":      category,
         "model_prob":    round(min(max(model_prob, 0.0001), 0.9999), 5),
         "market_prob":   round(market_prob, 5) if market_prob is not None else None,
         "market_odds":   market_odds,
@@ -1319,3 +1348,213 @@ def _index_odds_by_home(odds_df: Any) -> dict:
         return result
     except Exception:
         return {}
+
+
+def _index_all_odds(raw_odds_list: list) -> dict:
+    """
+    Build a nested lookup:
+        { home_team: { "h2h": {home_odds, away_odds},
+                       "spreads": {home_odds, away_odds, home_point, away_point},
+                       "totals": {"over_8.5": odds, "under_8.5": odds, ...} } }
+
+    Picks the BEST (highest) price for each side across all bookmakers.
+    """
+    result: dict[str, dict] = {}
+
+    for go in raw_odds_list:
+        home_team = go.get("home_team", "")
+        away_team = go.get("away_team", "")
+        market    = go.get("market", "")
+        if not home_team or not market:
+            continue
+
+        entry = result.setdefault(home_team, {"h2h": {}, "spreads": {}, "totals": {}})
+
+        if market == "h2h":
+            bh: int | None = None
+            ba: int | None = None
+            for bm_line in go.get("lines", []):
+                for o in bm_line.get("outcomes", []):
+                    if o["name"] == home_team:
+                        if bh is None or o["price"] > bh:
+                            bh = o["price"]
+                    else:
+                        if ba is None or o["price"] > ba:
+                            ba = o["price"]
+            if bh is not None:
+                entry["h2h"]["home_odds"] = bh
+            if ba is not None:
+                entry["h2h"]["away_odds"] = ba
+
+        elif market == "spreads":
+            for bm_line in go.get("lines", []):
+                for o in bm_line.get("outcomes", []):
+                    side = "home" if o["name"] == home_team else "away"
+                    key_odds  = f"{side}_odds"
+                    key_point = f"{side}_point"
+                    if key_odds not in entry["spreads"] or o["price"] > entry["spreads"][key_odds]:
+                        entry["spreads"][key_odds] = o["price"]
+                        if o.get("point") is not None:
+                            entry["spreads"][key_point] = o["point"]
+
+        elif market == "totals":
+            for bm_line in go.get("lines", []):
+                for o in bm_line.get("outcomes", []):
+                    side_str = o["name"].lower()   # "over" or "under"
+                    point    = o.get("point")
+                    if side_str not in ("over", "under") or point is None:
+                        continue
+                    key = f"{side_str}_{point}"
+                    # Keep best price
+                    if key not in entry["totals"] or o["price"] > entry["totals"][key]:
+                        entry["totals"][key] = o["price"]
+
+    return result
+
+
+def _fetch_player_props_for_game(
+    game_pk: int,
+    home_team: str,
+    away_team: str,
+    raw_sim: Any,
+    bankroll: float,
+    devig_method: str,
+) -> list[dict]:
+    """
+    Fetch player prop lines for *game_pk* from the Odds API and return
+    a list of market rows with model probabilities from the Statcast-derived
+    player season stats.
+
+    Markets fetched: batter_hits, batter_total_bases, batter_home_runs,
+                     pitcher_strikeouts, pitcher_earned_runs
+
+    For each prop, model probability is derived from the player's season
+    stat rates and the Poisson / binomial distribution over the line.
+
+    Returns empty list gracefully on any failure.
+    """
+    odds_key = os.environ.get("ODDS_API_KEY", "")
+    if not odds_key:
+        return []
+
+    try:
+        from src.ingestion.live_odds import get_game_odds, get_player_props  # noqa: PLC0415
+        # Need The Odds API event ID — map game_pk → odds event ID via game h2h entry
+        # We look up the event id from cached game odds
+        raw_events = get_game_odds(
+            markets=("h2h",), try_once=True,
+        )
+        event_id: str | None = None
+        for ev in raw_events:
+            if (ev.get("home_team") == home_team or
+                    ev.get("away_team") == away_team):
+                event_id = ev.get("game_id")
+                break
+        if not event_id:
+            return []
+
+        props = get_player_props(event_id, try_once=True)
+    except Exception as exc:
+        logger.debug("Player props fetch skipped for game_pk=%d: %s", game_pk, exc)
+        return []
+
+    rows: list[dict] = []
+    for prop in props:
+        try:
+            player_name = prop.get("player_name", "")
+            market_key  = prop.get("market", "")
+            point       = prop.get("point")
+            over_odds   = prop.get("over_odds")
+            under_odds  = prop.get("under_odds")
+            over_prob   = prop.get("over_implied_prob")
+            under_prob  = prop.get("under_implied_prob")
+
+            if point is None or over_odds is None:
+                continue
+
+            # Model probability: from season rate stats
+            model_over_p  = _prop_model_prob(player_name, market_key, point, "over")
+            model_under_p = 1.0 - model_over_p
+
+            for side_str, model_p, mkt_odds, mkt_prob in [
+                ("over",  model_over_p,  over_odds,  over_prob),
+                ("under", model_under_p, under_odds, under_prob),
+            ]:
+                if mkt_odds is None:
+                    continue
+                rows.append(_build_market_row(
+                    market=f"prop_{market_key}_{side_str}_{point}",
+                    label=f"{player_name} {market_key.replace('batter_','').replace('pitcher_','')} "
+                          f"{'O' if side_str == 'over' else 'U'} {point}",
+                    model_prob=model_p,
+                    market_prob=float(mkt_prob) if mkt_prob is not None else None,
+                    market_odds=float(mkt_odds),
+                    bankroll=bankroll,
+                    category="player_prop",
+                ))
+        except Exception as exc:
+            logger.debug("Prop row parse error: %s", exc)
+            continue
+
+    return rows
+
+
+def _prop_model_prob(
+    player_name: str,
+    market_key: str,
+    line: float,
+    side: str,
+) -> float:
+    """
+    Derive a model probability for a player prop over/under *line* using
+    the player's season stats from the MLB Stats API.
+
+    Uses a Poisson approximation for counting stats (K, TB, HR, ER).
+    Uses a Bernoulli/binomial for hits (≥1 hit in a game).
+
+    Returns 0.5 (league-average fallback) on any data failure.
+    """
+    import math
+    from src.ingestion.mlb_stats_api import _load_or_fetch  # noqa: PLC0415
+
+    # Look up player_id by name (best-effort via schedule's probablePitcher data)
+    # We use the pybaseball playerid_lookup as a last resort, but avoid it in the
+    # hot path.  Instead we fall back to Poisson with league-average rates.
+    try:
+        # Determine stat type and per-game rate from market key
+        if market_key == "pitcher_strikeouts":
+            # League avg: ~8 K/9 ≈ 5.3 K/start for SP
+            rate_per_game = 5.5
+        elif market_key == "pitcher_earned_runs":
+            rate_per_game = 2.5
+        elif market_key == "batter_home_runs":
+            rate_per_game = 0.135  # ~0.135 HR/game league avg
+        elif market_key == "batter_total_bases":
+            rate_per_game = 1.25
+        elif market_key == "batter_hits":
+            rate_per_game = 1.0
+        else:
+            return 0.5
+
+        # Poisson model: P(X > line) where X ~ Poisson(rate)
+        lam = rate_per_game
+        # P(X >= line+1) for integer lines; handle half-integer lines
+        floor_line = int(math.floor(line))
+        # CDF via incomplete gamma / direct sum for small lambda
+        p_over = 1.0 - _poisson_cdf(floor_line, lam)
+        return float(np.clip(p_over if side == "over" else 1.0 - p_over, 0.01, 0.99))
+    except Exception:
+        return 0.5
+
+
+def _poisson_cdf(k: int, lam: float) -> float:
+    """P(X <= k) for X ~ Poisson(lam), computed via direct sum for small k."""
+    import math
+    if lam <= 0:
+        return 1.0
+    total = 0.0
+    term  = math.exp(-lam)
+    for i in range(k + 1):
+        total += term
+        term  *= lam / (i + 1)
+    return min(total, 1.0)

@@ -36,6 +36,7 @@ export interface SimulationBlock {
 export interface MarketRow {
   market: string
   label: string
+  category: string  // 'moneyline' | 'spread' | 'total' | 'player_prop' | 'game'
   model_prob: number
   market_prob: number | null
   market_odds: number | null

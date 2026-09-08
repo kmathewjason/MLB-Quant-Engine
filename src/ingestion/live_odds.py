@@ -381,15 +381,17 @@ def get_player_props(
     markets: tuple[str, ...] | list[str] | None = None,
     regions: str = "us",
     force_refresh: bool = False,
+    try_once: bool = False,
 ) -> list[PropLine]:
     """
     Return player prop lines for a specific *game_id*.
 
     Parameters
     ----------
-    game_id  : The-Odds-API event ID (from get_game_odds)
-    markets  : subset of _PROP_MARKET_MAP keys; defaults to all five
-    regions  : comma-separated region string
+    game_id    : The-Odds-API event ID (from get_game_odds)
+    markets    : subset of _PROP_MARKET_MAP keys; defaults to all five
+    regions    : comma-separated region string
+    try_once   : if True, attempt exactly once with no retry (use in live endpoints)
 
     Returns
     -------
@@ -414,6 +416,7 @@ def get_player_props(
     raw = _fetch(
         f"sports/{_SPORT}/events/{game_id}/odds",
         params={"regions": regions, "markets": markets_str, "oddsFormat": "american"},
+        max_retries=0 if try_once else None,
     )
 
     result: list[PropLine] = []
