@@ -164,11 +164,11 @@ async def recommendations_today(
     """Full end-to-end bet-recommendation pipeline for today's slate."""
     import pandas as pd  # noqa: PLC0415
 
-    from src.ingestion.live_odds import fetch_live_odds          # noqa: PLC0415
+    from src.ingestion.live_odds import get_game_odds            # noqa: PLC0415
     from src.optimizer.vig_removal import best_devig             # noqa: PLC0415
     from src.optimizer.kelly import portfolio_kelly              # noqa: PLC0415
     from src.optimizer.portfolio_cap import apply_caps           # noqa: PLC0415
-    from src.ingestion.mlb_stats_api import fetch_schedule  # noqa: PLC0415
+    from src.ingestion.mlb_stats_api import fetch_schedule       # noqa: PLC0415
 
     game_date = date or _today_iso()
     try:
@@ -184,7 +184,30 @@ async def recommendations_today(
         raise HTTPException(status_code=503, detail="ODDS_API_KEY not configured")
 
     try:
-        odds_df = fetch_live_odds(sport="baseball_mlb", market="h2h")
+        raw_odds = get_game_odds(markets=("h2h",))
+        # Convert list[GameOdds] → flat DataFrame shape _index_odds_by_home expects
+        import pandas as pd  # noqa: PLC0415
+        odds_rows = []
+        for go in raw_odds:
+            if go.get("market") != "h2h":
+                continue
+            best_home: int | None = None
+            best_away: int | None = None
+            for bm_line in go.get("lines", []):
+                for o in bm_line.get("outcomes", []):
+                    if o["name"] == go["home_team"]:
+                        if best_home is None or o["price"] > best_home:
+                            best_home = o["price"]
+                    else:
+                        if best_away is None or o["price"] > best_away:
+                            best_away = o["price"]
+            odds_rows.append({
+                "home_team":  go["home_team"],
+                "away_team":  go["away_team"],
+                "home_price": best_home,
+                "away_price": best_away,
+            })
+        odds_df = pd.DataFrame(odds_rows)
     except Exception as exc:
         logger.error("Live odds fetch failed: %s", exc)
         raise HTTPException(status_code=502, detail="Odds API unavailable") from None
@@ -192,13 +215,14 @@ async def recommendations_today(
     sim_rows = []
     for g in games:
         try:
-            pk = int(g.get("gamePk", 0))
+            pk = int(g.get("game_pk") or g.get("gamePk") or 0)
             if pk == 0:
                 continue
             _run_simulation_cached(pk)
             sim_rows.append({"game_pk": pk, **_sim_cache[pk]})
         except Exception as exc:
-            logger.warning("Simulation failed for game_pk=%s: %s", g.get("gamePk"), exc)
+            logger.warning("Simulation failed for game_pk=%s: %s",
+                           g.get("game_pk") or g.get("gamePk"), exc)
 
     if not sim_rows:
         return []
@@ -436,16 +460,38 @@ async def api_daily_predictions(
     odds_by_home: dict[str, dict] = {}
     if odds_key:
         try:
-            from src.ingestion.live_odds import fetch_live_odds  # noqa: PLC0415
-            odds_df = fetch_live_odds(sport="baseball_mlb", market="h2h")
-            odds_by_home = _index_odds_by_home(odds_df)
+            from src.ingestion.live_odds import get_game_odds    # noqa: PLC0415
+            import pandas as _pd                                  # noqa: PLC0415
+            raw_odds_list = get_game_odds(markets=("h2h",))
+            _odds_rows: list[dict] = []
+            for _go in raw_odds_list:
+                if _go.get("market") != "h2h":
+                    continue
+                _bh: int | None = None
+                _ba: int | None = None
+                for _bm in _go.get("lines", []):
+                    for _o in _bm.get("outcomes", []):
+                        if _o["name"] == _go["home_team"]:
+                            if _bh is None or _o["price"] > _bh:
+                                _bh = _o["price"]
+                        else:
+                            if _ba is None or _o["price"] > _ba:
+                                _ba = _o["price"]
+                _odds_rows.append({
+                    "home_team":  _go["home_team"],
+                    "away_team":  _go["away_team"],
+                    "home_price": _bh,
+                    "away_price": _ba,
+                })
+            odds_by_home = _index_odds_by_home(_pd.DataFrame(_odds_rows))
         except Exception as exc:
             logger.warning("Odds fetch failed (continuing without sizing): %s", exc)
 
     # ── 3. Simulate + build per-game payload ──────────────────────────────
     payload = []
     for g in games:
-        pk = int(g.get("gamePk", 0))
+        # fetch_schedule returns snake_case: game_pk, home_team_name, away_team_name
+        pk = int(g.get("game_pk") or g.get("gamePk") or 0)
         if pk == 0:
             continue
 
@@ -999,18 +1045,40 @@ async def api_backtest_report() -> dict:
 # ===========================================================================
 
 def _format_game(g: dict) -> dict:
-    """Flatten an MLB Stats API game dict into the shared API response shape."""
+    """
+    Flatten a game dict into the shared API response shape.
+
+    Handles both:
+    - fetch_schedule() output: snake_case keys (game_pk, home_team_name, …)
+    - Raw MLB Stats API shape:  camelCase keys (gamePk, teams.home.team.name, …)
+    """
+    # --- snake_case output from fetch_schedule ---
+    if "game_pk" in g:
+        return {
+            "game_pk":               int(g["game_pk"]),
+            "game_date":             g.get("game_date", ""),
+            "away_team":             g.get("away_team_name", ""),
+            "home_team":             g.get("home_team_name", ""),
+            "status":                g.get("status", ""),
+            "away_probable_pitcher": g.get("away_probable_pitcher", {}).get("fullName", "TBD")
+                                     if isinstance(g.get("away_probable_pitcher"), dict)
+                                     else g.get("away_probable_pitcher", "TBD"),
+            "home_probable_pitcher": g.get("home_probable_pitcher", {}).get("fullName", "TBD")
+                                     if isinstance(g.get("home_probable_pitcher"), dict)
+                                     else g.get("home_probable_pitcher", "TBD"),
+        }
+    # --- raw MLB Stats API camelCase shape (fallback) ---
     teams = g.get("teams", {})
     home  = teams.get("home", {})
     away  = teams.get("away", {})
     return {
-        "game_pk":                int(g.get("gamePk", 0)),
-        "game_date":              g.get("officialDate", g.get("gameDate", "")),
-        "away_team":              away.get("team", {}).get("name", ""),
-        "home_team":              home.get("team", {}).get("name", ""),
-        "status":                 g.get("status", {}).get("detailedState", ""),
-        "away_probable_pitcher":  away.get("probablePitcher", {}).get("fullName", "TBD"),
-        "home_probable_pitcher":  home.get("probablePitcher", {}).get("fullName", "TBD"),
+        "game_pk":               int(g.get("gamePk", 0)),
+        "game_date":             g.get("officialDate", g.get("gameDate", "")),
+        "away_team":             away.get("team", {}).get("name", ""),
+        "home_team":             home.get("team", {}).get("name", ""),
+        "status":                g.get("status", {}).get("detailedState", ""),
+        "away_probable_pitcher": away.get("probablePitcher", {}).get("fullName", "TBD"),
+        "home_probable_pitcher": home.get("probablePitcher", {}).get("fullName", "TBD"),
     }
 
 
