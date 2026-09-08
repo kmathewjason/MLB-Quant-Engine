@@ -2,22 +2,32 @@
 mlb-quant-engine — entry point
 ===============================
 
-Run the FastAPI server:
-    uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+Default (no flags):
+    .venv/bin/python main.py
+    → Starts the FastAPI server at http://127.0.0.1:8000
 
-Run the daily prediction pipeline:
-    python main.py --run-pipeline [--date YYYY-MM-DD] [--bankroll 1000]
+Daily pipeline:
+    .venv/bin/python main.py --pipeline [--date YYYY-MM-DD] [--bankroll 1000]
 
-The pipeline sequence:
+Walk-forward backtest:
+    .venv/bin/python main.py --backtest [--date YYYY-MM-DD]
+
+Print bet recommendations to stdout:
+    .venv/bin/python main.py --recommend [--date YYYY-MM-DD] [--bankroll 1000]
+
+Pipeline sequence (--pipeline):
     1. Fetch today's schedule (MLB Stats API)
     2. Fetch live odds (The-Odds-API)
-    3. Fetch Statcast data for upcoming pitchers/batters
-    4. Compute features (batter, pitcher, matchup, park/weather)
-    5. Run Monte Carlo game simulations
-    6. De-vig market odds and compute model edge
-    7. Kelly sizing + portfolio caps
-    8. Write recommendations to data/predictions/recommendations_YYYY-MM-DD.csv
-    9. Generate backtest HTML report (if --backtest flag is set)
+    3. Run Monte Carlo game simulations (league-average priors)
+    4. De-vig market odds and compute model edge
+    5. Kelly sizing + portfolio caps
+    6. Write recommendations to data/predictions/recommendations_YYYY-MM-DD.csv
+
+Backtest sequence (--backtest):
+    1. Load historical PA data from data/processed/
+    2. Run walk_forward_validate() with expanding-window folds
+    3. Compute calibration + CLV + Brier decomposition
+    4. Write JSON/parquet outputs + HTML report to data/predictions/
 """
 
 from __future__ import annotations
@@ -233,18 +243,191 @@ def run_pipeline(
 
 
 # ---------------------------------------------------------------------------
+# Backtest runner
+# ---------------------------------------------------------------------------
+
+def run_backtest(
+    output_dir: str = "data/predictions",
+) -> int:
+    """
+    Run the walk-forward backtest on historical PA data.
+
+    Expects data/processed/pa_features.parquet to exist (produced by the
+    feature-engineering pipeline).  Outputs JSON/Parquet/HTML to output_dir.
+
+    Returns 0 on success, 1 on error.
+    """
+    import json
+    import pandas as pd
+
+    from src.backtest.walk_forward import walk_forward_validate, WalkForwardConfig
+    from src.backtest.calibration import calibration_report
+    from src.backtest.run_report import build_report, save_report
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    pa_path = Path("data/processed/pa_features.parquet")
+    if not pa_path.exists():
+        logger.error(
+            "PA feature file not found at %s. "
+            "Run the feature engineering pipeline first.",
+            pa_path,
+        )
+        return 1
+
+    logger.info("=== Walk-forward backtest ===")
+    try:
+        df = pd.read_parquet(pa_path)
+        logger.info("Loaded %d PA rows from %s", len(df), pa_path)
+    except Exception as exc:
+        logger.error("Failed to load PA features: %s", exc)
+        return 1
+
+    # ── Walk-forward validation ────────────────────────────────────────────
+    try:
+        cfg = WalkForwardConfig()
+        wf_result = walk_forward_validate(df, config=cfg)
+        logger.info(
+            "Walk-forward complete: %d folds, %d OOS predictions",
+            len(wf_result.fold_metrics), len(wf_result.predictions_df),
+        )
+    except Exception as exc:
+        logger.error("Walk-forward failed: %s", exc)
+        return 1
+
+    # ── Persist outputs ────────────────────────────────────────────────────
+    summary_path = out_dir / "backtest_summary.json"
+    with summary_path.open("w") as fh:
+        json.dump(wf_result.summary, fh, indent=2)
+    logger.info("Summary written to %s", summary_path)
+
+    folds_path = out_dir / "wf_fold_metrics.json"
+    with folds_path.open("w") as fh:
+        json.dump(wf_result.fold_metrics, fh, indent=2, default=str)
+    logger.info("Fold metrics written to %s", folds_path)
+
+    preds_path = out_dir / "wf_predictions.parquet"
+    wf_result.predictions_df.to_parquet(preds_path, index=False)
+    logger.info("OOS predictions written to %s", preds_path)
+
+    # ── Calibration report ─────────────────────────────────────────────────
+    try:
+        cal_df = calibration_report(wf_result.predictions_df)
+        cal_path = out_dir / "calibration_report.csv"
+        cal_df.to_csv(cal_path, index=False)
+        logger.info("Calibration report written to %s", cal_path)
+    except Exception as exc:
+        logger.warning("Calibration report failed (non-fatal): %s", exc)
+        cal_df = None
+
+    # ── HTML report ────────────────────────────────────────────────────────
+    try:
+        html = build_report(
+            wf_result=wf_result,
+            cal_df=cal_df,
+            clv_df=None,
+            dispersion_summary=None,
+        )
+        report_path = save_report(html, out_dir / "backtest_report.html")
+        logger.info("HTML report written to %s", report_path)
+    except Exception as exc:
+        logger.warning("HTML report generation failed (non-fatal): %s", exc)
+
+    logger.info("=== Backtest complete ===")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Recommendations printer (stdout, no server required)
+# ---------------------------------------------------------------------------
+
+def run_recommend(
+    date: str | None = None,
+    bankroll: float = 1000.0,
+    devig_method: str = "power",
+    n_sims: int = 50_000,
+) -> int:
+    """
+    Run the pipeline and print bet recommendations to stdout.
+    No CSV output; no server required.  Returns 0 on success, 1 on error.
+    """
+    import json
+
+    # Reuse the pipeline; capture via --output to a temp dir
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        rc = run_pipeline(
+            date=date,
+            bankroll=bankroll,
+            devig_method=devig_method,
+            n_sims=n_sims,
+            output_dir=tmp,
+        )
+        if rc != 0:
+            return rc
+
+        game_date = date or datetime.date.today().isoformat()
+        recs_path = Path(tmp) / f"recommendations_{game_date}.csv"
+        if not recs_path.exists():
+            logger.info("No recommendations generated for %s.", game_date)
+            return 0
+
+        import pandas as pd
+        recs = pd.read_csv(recs_path)
+        if recs.empty:
+            logger.info("No positive-EV bets found for %s.", game_date)
+            return 0
+
+        print(f"\n{'='*60}")
+        print(f"  MLB Bet Recommendations — {game_date}")
+        print(f"  Bankroll: ${bankroll:,.0f}  |  De-vig: {devig_method}")
+        print(f"{'='*60}")
+        for _, row in recs.iterrows():
+            ev_pct = row.get("ev", 0) * 100 if "ev" in recs.columns else float("nan")
+            stake  = row.get("stake_units", row.get("f_quarter", 0))
+            print(
+                f"  {row.get('home_team','?')} vs {row.get('away_team','?')}"
+                f"  | side={row.get('side','?')}"
+                f"  | EV={ev_pct:+.1f}%"
+                f"  | stake=${float(stake):,.0f}",
+            )
+        print(f"{'='*60}\n")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="MLB Quant Engine — server or pipeline runner",
+        description="MLB Quant Engine — server, pipeline, backtest, or recommend",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--run-pipeline", action="store_true",
-                   help="Execute the daily prediction pipeline and exit")
-    p.add_argument("--date",     default=None,
-                   help="ISO date for the pipeline (default: today)")
+
+    # ── mode flags (mutually exclusive) ───────────────────────────────────
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--pipeline", action="store_true",
+        help="Run the full ingestion→simulation→optimisation pipeline and exit",
+    )
+    mode.add_argument(
+        "--run-pipeline", action="store_true",
+        help=argparse.SUPPRESS,   # legacy alias for --pipeline
+    )
+    mode.add_argument(
+        "--backtest", action="store_true",
+        help="Run walk-forward backtest, write HTML report to --output, and exit",
+    )
+    mode.add_argument(
+        "--recommend", action="store_true",
+        help="Print today's bet recommendations to stdout and exit",
+    )
+
+    # ── shared parameters ─────────────────────────────────────────────────
+    p.add_argument("--date",     default=None, metavar="YYYY-MM-DD",
+                   help="ISO date for pipeline/recommend/backtest (default: today)")
     p.add_argument("--bankroll", type=float, default=1000.0,
                    help="Bankroll in units for Kelly sizing")
     p.add_argument("--devig",    default="power",
@@ -253,22 +436,34 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-sims",   type=int, default=50_000,
                    help="Monte Carlo simulations per game")
     p.add_argument("--output",   default="data/predictions",
-                   help="Output directory for CSV results")
+                   metavar="DIR",
+                   help="Output directory for CSV/JSON/Parquet results")
+
+    # ── server parameters ─────────────────────────────────────────────────
     p.add_argument("--port",     type=int, default=8000,
-                   help="Port for the FastAPI server (--run-pipeline not set)")
+                   help="FastAPI listen port (only used without a mode flag)")
     return p
 
 
 if __name__ == "__main__":
     args = _build_parser().parse_args()
 
-    if args.run_pipeline:
+    if args.pipeline or args.run_pipeline:
         sys.exit(run_pipeline(
             date=args.date,
             bankroll=args.bankroll,
             devig_method=args.devig,
             n_sims=args.n_sims,
             output_dir=args.output,
+        ))
+    elif args.backtest:
+        sys.exit(run_backtest(output_dir=args.output))
+    elif args.recommend:
+        sys.exit(run_recommend(
+            date=args.date,
+            bankroll=args.bankroll,
+            devig_method=args.devig,
+            n_sims=args.n_sims,
         ))
     else:
         import uvicorn

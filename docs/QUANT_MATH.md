@@ -689,6 +689,188 @@ Likely causes of underdispersion:
 
 ---
 
+## 15. Favourite-Longshot Bias (FLB) Detection
+
+**File:** `src/optimizer/vig_removal.py` — `favorite_longshot_bias()`
+
+### What FLB Is
+
+In betting markets, implied probabilities for large favourites tend to be
+*overstated* relative to their true frequency, while longshots are
+*understated*.  This means naive additive de-vig over-prices favourites.
+
+### Detection: Power vs Additive Divergence
+
+Define the power-method probability `p_pow_fav` and additive probability
+`p_add_fav` for the favourite side of a two-way market:
+
+```
+flb_index = (p_pow_fav − p_add_fav) / vig_pct
+```
+
+where `vig_pct = overround − 1` (e.g., 0.045 for a 4.5% book).
+
+**Interpretation:**
+- `flb_index > 0` → power assigns more probability to the favourite than
+  additive does, consistent with standard FLB.  The two methods disagree most
+  when the market is lopsided.
+- `flb_index ≈ 0` → near-50/50 market; both methods agree.
+
+This index is dimensionless and market-size-neutral: a 3-point and a 30-point
+favourite with the same vig percentage produce comparable indices.
+
+### Why This Matters
+
+If you use additive de-vig on a heavily-juiced favourite (e.g., −250 / +200)
+you will systematically underestimate the favourite's true probability and
+overestimate the longshot's — the opposite of real-world FLB.  The power
+method is preferred because it preserves the log-odds ratio structure and
+empirically matches actual win frequencies better on lopsided markets.
+
+---
+
+## 16. Same-Game Parlay: Empirical Correlation Model
+
+**File:** `src/optimizer/kelly.py` — `simulate_corr_matrix()`
+**File:** `src/api.py` — `POST /api/predictions/sgp`
+
+### Why Independence Fails for SGPs
+
+A same-game parlay (SGP) bundles multiple legs from the same game.  The legs
+are **not** independent: home moneyline and over total are positively correlated
+(high-scoring games help the home team in baseball because they bat last), and
+home ML and away ML are almost perfectly negatively correlated (one wins iff
+the other loses).
+
+Using the naive product `Π pᵢ` as the joint probability systematically
+misprices SGPs.
+
+### Simulation-Based Joint Probability
+
+Run `N` Monte Carlo game simulations using the standard half-inning engine.
+For each leg `i` and simulation `j`, record the binary outcome `Xᵢⱼ ∈ {0,1}`:
+
+```
+moneyline leg: Xᵢⱼ = 1 if home wins sim j  (or away wins, depending on side)
+over/under leg: Xᵢⱼ = 1 if total > line in sim j
+spread leg:    Xᵢⱼ = 1 if home − away > run_line in sim j
+```
+
+The **empirical correlation matrix** is:
+
+```
+ρᵢₖ = Cov(Xᵢ, Xₖ) / sqrt(Var(Xᵢ) · Var(Xₖ))
+     = (mean(Xᵢ · Xₖ) − mean(Xᵢ)·mean(Xₖ)) / ...
+```
+
+computed directly from the simulation outcomes (`numpy.corrcoef`).
+
+The **correlation-adjusted joint probability** is the empirical frequency
+of all legs winning simultaneously:
+
+```
+p_joint_corr = mean(min_i(Xᵢⱼ) = 1)  for j = 1…N
+             = fraction of sims where every leg fires
+```
+
+This is strictly more accurate than `Π pᵢ` because it captures the full
+dependence structure, not just pairwise correlations.
+
+### Same-Game Deduplication
+
+Legs from the same game share the same simulation draws (`_game_key`
+deduplication in the code ensures this).  A two-leg SGP on game `G` uses
+the same `N` simulation paths for both legs — only one simulation is run
+per unique game, no matter how many legs reference it.
+
+### Kelly Sizing for the Parlay
+
+Treat the SGP as a single binary bet with:
+
+```
+p  = p_joint_corr       (correlation-adjusted)
+b  = Π dᵢ − 1          (net payout; dᵢ = decimal odds per leg)
+```
+
+Standard single-bet Kelly applies:
+
+```
+f* = (b·p − q) / b
+f  = f* / 4            (quarter Kelly)
+```
+
+The naive comparison uses `p_naive = Π pᵢ` in place of `p_joint_corr`.
+The **percentage difference** `(f_corr − f_naive) / f_naive` quantifies
+the dollar value of the correlation model — visible in the SGP Builder tab.
+
+### Interpretation
+
+| Leg combination | ρ sign | Corr adj vs naive |
+|---|---|---|
+| Home ML + Over total | positive | corr stake > naive |
+| Home ML + Away ML | ≈ −1 | joint prob ≈ 0 (can't both win) |
+| Two totals (e.g., both O8.5 and O9.5) | positive | corr stake > naive |
+| Home ML + Under total | negative | corr stake < naive |
+
+---
+
+## 17. Bootstrap Drawdown Simulator
+
+**File:** `src/optimizer/portfolio_cap.py` — `bootstrap_drawdown_simulator()`
+
+### Motivation
+
+Maximum drawdown (MDD) cannot be computed analytically for correlated,
+non-normal bet outcomes.  We use parametric bootstrap to build a distribution
+over MDD and terminal bankroll under different Kelly fractions.
+
+### Algorithm
+
+Given `n_bets` bet records with outcomes `yᵢ ∈ {0,1}` and stakes `sᵢ`:
+
+1. Draw `n_paths × n_bets` bootstrap samples (with replacement) from
+   the bet population.
+2. For each Kelly fraction `f_scale ∈ {1, 0.5, 0.25, 0.125}` (full, half,
+   quarter, eighth):
+   - Scale all stakes: `sⱼ = f_scale × s_original`
+   - Compute running P&L per path:  `W_t = W_0 + Σⱼ sⱼ · (yⱼ · bⱼ − (1−yⱼ))`
+   - Maximum drawdown per path: `MDD_path = max_t (max_{t'≤t} W_{t'} − W_t)`
+
+3. Report `p05`, `p50`, `p95` of the MDD distribution and `p05`, `p50`,
+   `mean` of the terminal bankroll distribution.
+
+### Vectorised Implementation
+
+The bootstrap is fully NumPy-vectorised:
+
+```python
+# shape: (n_paths, n_bets)
+idx = rng.integers(0, n_bets, size=(n_paths, n_bets))
+outcomes = y[idx]          # (n_paths, n_bets)
+payouts  = payout[idx]     # (n_paths, n_bets)
+
+# P&L per bet: +payout if win, −stake if loss
+pnl = np.where(outcomes == 1, payouts, -stakes[idx])
+
+# Running sum along bet axis
+running = np.cumsum(pnl, axis=1)
+
+# MDD from cummax
+cummax = np.maximum.accumulate(running, axis=1)
+mdd    = (cummax - running).max(axis=1)
+```
+
+No Python loop over individual paths — all `n_paths` are computed in a
+single vectorised pass.
+
+### Interpretation
+
+The MDD `p05` at full Kelly is the worst-case drawdown you should plan for.
+If `p05 MDD at full Kelly > max_drawdown_cap` (default 20%), the portfolio
+cap kicks in and scales stakes down until the expected MDD is acceptable.
+
+---
+
 ## Summary: Data Flow
 
 ```
@@ -705,15 +887,17 @@ Game win probabilities            ← Monte Carlo (50k sims, vectorised NumPy)
 Fair odds (de-vigged)             ← Power / Shin method
 Kelly fractions                   ← Covariance-adjusted portfolio Kelly
 Capped stakes                     ← Per-bet + team + daily + drawdown guardrails
+SGP joint probability             ← Empirical correlation (simulation-based)
     ↓  backtest/
 Walk-forward OOS metrics          ← Temporal split, no data leakage
 CLV tracking                      ← Closing-line value vs. placed-line value
+FLB detection                     ← Power vs additive divergence index
 HTML report                       ← run_report.py
     ↓  api.py / dashboard
 REST API (127.0.0.1:8000)
-React dashboard (localhost:5173)
+React dashboard (127.0.0.1:5173)
 ```
 
 ---
 
-*Last updated: Phase 8 (complete build)*
+*Last updated: Phase 9 (SGP correlation model, FLB detection, drawdown bootstrap)*
