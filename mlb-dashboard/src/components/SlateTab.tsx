@@ -1,95 +1,284 @@
 /**
- * SlateTab — daily slate with sortable/filterable market table.
- *
- * Filters  : market type (h2h / total / spread), min edge %, min EV %
- * Sort     : click any column header; second click reverses
- * Game detail: click a row → GameDetailModal opens for that game_pk
+ * SlateTab — Today's game slate with search, game cards, and ranked
+ * betting opportunities sorted by model confidence.
  */
 import { useState, useEffect, useMemo } from 'react'
 import { fetchDailyPredictions } from '../api'
 import type { DailyGame, MarketRow } from '../types'
 import GameDetailModal from './GameDetailModal'
 
-// ── helpers ────────────────────────────────────────────────────────────────
+// ── colour helpers ─────────────────────────────────────────────────────────
 
-function pct(v: number | null, decimals = 1) {
-  if (v === null) return <span className="text-gray-300">—</span>
-  return <span>{(v * 100).toFixed(decimals)}%</span>
+const S = {
+  page:        { color: '#e8eaf0' },
+  card:        { background: '#1a1d27', border: '1px solid #262a36', borderRadius: 12 },
+  cardHover:   { background: '#1e2130' },
+  label:       { fontSize: 10, fontWeight: 600, letterSpacing: '0.06em', color: '#5a6072', textTransform: 'uppercase' as const },
+  muted:       { color: '#6b7280', fontSize: 12 },
+  accent:      { color: '#4faeff' },
+  green:       { color: '#34d399' },
+  red:         { color: '#f87171' },
+  amber:       { color: '#fbbf24' },
+  surface:     { background: '#12141b' },
+  divider:     { borderTop: '1px solid #1f2230' },
 }
 
-function signed(v: number | null) {
-  if (v === null) return <span className="text-gray-300">—</span>
-  const cls = v >= 0 ? 'text-pos bg-pos-bg' : 'text-neg bg-neg-bg'
+// ── confidence badge ───────────────────────────────────────────────────────
+
+function ConfBadge({ prob }: { prob: number }) {
+  const pct = Math.round(prob * 100)
+  // Confidence = how far the model is from 50/50 (0–50 scale, capped at 50)
+  const conf = Math.min(50, Math.abs(pct - 50))
+  let bg: string, fg: string, label: string
+  if (conf >= 15) { bg = '#0d3326'; fg = '#34d399'; label = 'HIGH CONF' }
+  else if (conf >= 8) { bg = '#2a1f07'; fg = '#fbbf24'; label = 'MEDIUM' }
+  else { bg = '#1e1e2e'; fg = '#6b7280'; label = 'COIN FLIP' }
   return (
-    <span className={`inline-block px-1.5 py-0.5 rounded text-xs font-semibold ${cls}`}>
-      {v >= 0 ? '+' : ''}{(v * 100).toFixed(1)}%
+    <span style={{
+      background: bg, color: fg, borderRadius: 4, padding: '2px 6px',
+      fontSize: 9, fontWeight: 700, letterSpacing: '0.07em',
+    }}>
+      {label}
     </span>
   )
 }
 
-function odds(v: number | null) {
-  if (v === null) return <span className="text-gray-300">—</span>
-  return <span>{v > 0 ? `+${v}` : v}</span>
-}
+// ── win probability bar ────────────────────────────────────────────────────
 
-type SortKey = keyof MarketRow | 'game'
-type SortDir = 'asc' | 'desc'
-
-interface FlatRow extends MarketRow {
-  game_pk: number
-  matchup: string
-  game_date: string
-}
-
-const MARKET_TYPE_OPTIONS = [
-  { value: '',       label: 'All markets' },
-  { value: 'h2h',    label: 'Moneyline (h2h)' },
-  { value: 'total',  label: 'Totals' },
-  { value: 'spread', label: 'Spread' },
-]
-
-// ── sub-components ─────────────────────────────────────────────────────────
-
-function SortHeader({
-  label, col, sortCol, sortDir, onSort,
-}: {
-  label: string; col: SortKey; sortCol: SortKey; sortDir: SortDir
-  onSort: (k: SortKey) => void
+function WinBar({ home, homeTeam, awayTeam }: {
+  home: number; homeTeam: string; awayTeam: string
 }) {
-  const active = sortCol === col
+  const hp = Math.round(home * 100)
+  const ap = 100 - hp
   return (
-    <th
-      className="px-3 py-2 text-left text-xs font-semibold text-muted uppercase tracking-wide cursor-pointer select-none whitespace-nowrap hover:text-gray-700"
-      onClick={() => onSort(col)}
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+        <span style={{ fontSize: 11, color: '#9ca3af' }}>{awayTeam.split(' ').pop()} {ap}%</span>
+        <span style={{ fontSize: 11, color: '#9ca3af' }}>{hp}% {homeTeam.split(' ').pop()}</span>
+      </div>
+      <div style={{ height: 6, borderRadius: 6, background: '#262a36', overflow: 'hidden', display: 'flex' }}>
+        <div style={{
+          width: `${ap}%`, background: hp >= ap ? '#374151' : '#4faeff',
+          transition: 'width 0.4s', borderRadius: '6px 0 0 6px',
+        }} />
+        <div style={{
+          width: `${hp}%`, background: hp >= ap ? '#4faeff' : '#374151',
+          transition: 'width 0.4s', borderRadius: '0 6px 6px 0',
+        }} />
+      </div>
+    </div>
+  )
+}
+
+// ── ranked bet row ─────────────────────────────────────────────────────────
+
+function BetRow({ m, rank }: { m: MarketRow; rank: number }) {
+  const hasOdds = m.ev !== null
+  const conf = Math.round(m.model_prob * 100)
+  const edgePct = m.edge !== null ? (m.edge * 100).toFixed(1) : null
+  const evPct   = m.ev   !== null ? (m.ev   * 100).toFixed(1) : null
+
+  const rankColor = rank === 1 ? '#fbbf24' : rank === 2 ? '#9ca3af' : rank === 3 ? '#cd7c2e' : '#4b5563'
+
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 10,
+      padding: '8px 12px', borderBottom: '1px solid #1a1d27',
+    }}>
+      {/* Rank */}
+      <span style={{
+        width: 20, height: 20, borderRadius: '50%', background: rankColor,
+        color: rank <= 3 ? '#000' : '#9ca3af', fontSize: 10, fontWeight: 700,
+        display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+      }}>
+        {rank}
+      </span>
+
+      {/* Label */}
+      <span style={{ flex: 1, fontSize: 12.5, color: '#d1d5db', fontWeight: 500 }}>
+        {m.label}
+      </span>
+
+      {/* Model % */}
+      <span style={{ width: 42, textAlign: 'right', fontSize: 12, fontWeight: 700, color: '#e8eaf0' }}>
+        {conf}%
+      </span>
+
+      {/* Edge */}
+      {hasOdds ? (
+        <span style={{
+          width: 52, textAlign: 'right', fontSize: 11.5, fontWeight: 600,
+          color: (m.edge ?? 0) >= 0 ? '#34d399' : '#f87171',
+        }}>
+          {(m.edge ?? 0) >= 0 ? '+' : ''}{edgePct}%
+        </span>
+      ) : (
+        <span style={{ width: 52, textAlign: 'right', fontSize: 11, color: '#3d4455' }}>
+          no odds
+        </span>
+      )}
+
+      {/* EV */}
+      {hasOdds ? (
+        <span style={{
+          width: 48, textAlign: 'right', fontSize: 11, fontWeight: 600,
+          color: (m.ev ?? 0) >= 0.01 ? '#34d399' : '#6b7280',
+        }}>
+          {(m.ev ?? 0) >= 0 ? '+' : ''}{evPct}%
+        </span>
+      ) : (
+        <span style={{ width: 48, textAlign: 'right', color: '#2d3040', fontSize: 10 }}>—</span>
+      )}
+
+      {/* Stake */}
+      {m.stake_units !== null ? (
+        <span style={{
+          width: 50, textAlign: 'right', fontSize: 12, fontWeight: 700, color: '#4faeff',
+        }}>
+          ${Math.round(m.stake_units)}
+        </span>
+      ) : (
+        <span style={{ width: 50, textAlign: 'right', color: '#2d3040', fontSize: 10 }}>—</span>
+      )}
+    </div>
+  )
+}
+
+// ── game card ──────────────────────────────────────────────────────────────
+
+function GameCard({ game, onSelect }: { game: DailyGame; onSelect: () => void }) {
+  const sim = game.simulation
+  const topBets = useMemo(() => {
+    return [...game.markets]
+      .sort((a, b) => {
+        // Sort by model confidence distance from 50%
+        const ca = Math.abs(a.model_prob - 0.5)
+        const cb = Math.abs(b.model_prob - 0.5)
+        if (a.ev !== null && b.ev !== null) return (b.ev - a.ev)
+        if (a.ev !== null) return -1
+        if (b.ev !== null) return 1
+        return cb - ca
+      })
+      .slice(0, 4)
+  }, [game.markets])
+
+  const homeWin = sim.home_win_prob >= 0.5
+  const favProb = homeWin ? sim.home_win_prob : sim.away_win_prob
+
+  return (
+    <div
+      onClick={onSelect}
+      style={{
+        ...S.card,
+        cursor: 'pointer',
+        transition: 'border-color 0.15s, background 0.15s',
+        overflow: 'hidden',
+      }}
+      onMouseEnter={e => {
+        (e.currentTarget as HTMLElement).style.borderColor = '#3a4259'
+        ;(e.currentTarget as HTMLElement).style.background = '#1e2130'
+      }}
+      onMouseLeave={e => {
+        (e.currentTarget as HTMLElement).style.borderColor = '#262a36'
+        ;(e.currentTarget as HTMLElement).style.background = '#1a1d27'
+      }}
     >
-      {label}
-      {active && <span className="ml-1 opacity-60">{sortDir === 'asc' ? '↑' : '↓'}</span>}
-    </th>
+      {/* Header row */}
+      <div style={{ padding: '14px 16px 12px', borderBottom: '1px solid #1f2230' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 10 }}>
+          {/* Matchup */}
+          <div>
+            <div style={{ fontSize: 13.5, fontWeight: 700, color: '#fff', marginBottom: 2 }}>
+              {game.away_team} <span style={{ color: '#4b5563', fontWeight: 400 }}>@</span> {game.home_team}
+            </div>
+            <div style={{ fontSize: 11, color: '#4b5563' }}>
+              {game.game_date}
+              {game.away_probable_pitcher !== 'TBD' && (
+                <span style={{ marginLeft: 8 }}>
+                  {game.away_probable_pitcher.split(' ').pop()} vs {game.home_probable_pitcher.split(' ').pop()}
+                </span>
+              )}
+            </div>
+          </div>
+          {/* Status + confidence */}
+          <div style={{ textAlign: 'right', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
+            <span style={{
+              fontSize: 9, background: '#1c2230', color: '#4faeff',
+              borderRadius: 4, padding: '2px 6px', fontWeight: 600, letterSpacing: '0.05em',
+            }}>
+              {game.status.toUpperCase()}
+            </span>
+            <ConfBadge prob={favProb} />
+          </div>
+        </div>
+
+        {/* Win probability bar */}
+        <WinBar
+          home={sim.home_win_prob}
+          homeTeam={game.home_team} awayTeam={game.away_team}
+        />
+      </div>
+
+      {/* Run totals row */}
+      <div style={{
+        display: 'flex', padding: '8px 16px', gap: 20,
+        borderBottom: '1px solid #1a1d27', background: '#15171f',
+      }}>
+        {[
+          { label: `${game.away_team.split(' ').pop()} Runs`, val: sim.away_runs.mean.toFixed(1) },
+          { label: `${game.home_team.split(' ').pop()} Runs`, val: sim.home_runs.mean.toFixed(1) },
+          { label: 'Total', val: sim.total_runs.mean.toFixed(1) },
+          { label: 'Spread Cover', val: `${Math.round((sim.spread['home_cover_prob_m1.5'] ?? 0.5) * 100)}%` },
+        ].map(item => (
+          <div key={item.label} style={{ flex: 1, textAlign: 'center' }}>
+            <div style={{ fontSize: 13.5, fontWeight: 700, color: '#e8eaf0' }}>{item.val}</div>
+            <div style={{ ...S.label, marginTop: 1 }}>{item.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Ranked bets */}
+      <div>
+        {/* Column header */}
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 10,
+          padding: '6px 12px', background: '#12141b',
+        }}>
+          <span style={{ width: 20 }} />
+          <span style={{ flex: 1, ...S.label }}>Market</span>
+          <span style={{ width: 42, textAlign: 'right', ...S.label }}>Model</span>
+          <span style={{ width: 52, textAlign: 'right', ...S.label }}>Edge</span>
+          <span style={{ width: 48, textAlign: 'right', ...S.label }}>EV</span>
+          <span style={{ width: 50, textAlign: 'right', ...S.label }}>Stake</span>
+        </div>
+        {topBets.map((m, i) => <BetRow key={m.market} m={m} rank={i + 1} />)}
+      </div>
+
+      {/* Footer */}
+      <div style={{
+        padding: '7px 14px', background: '#12141b',
+        fontSize: 10.5, color: '#3d4455', textAlign: 'right',
+      }}>
+        {sim.n_sims.toLocaleString()} simulations · click for full distribution →
+      </div>
+    </div>
   )
 }
 
 // ── main component ─────────────────────────────────────────────────────────
 
 export default function SlateTab() {
-  const [games,    setGames]    = useState<DailyGame[]>([])
-  const [loading,  setLoading]  = useState(false)
-  const [error,    setError]    = useState<string | null>(null)
-  const [date,     setDate]     = useState('')
-  const [detail,   setDetail]   = useState<{ game: DailyGame; totalLine: number } | null>(null)
+  const [games,   setGames]   = useState<DailyGame[]>([])
+  const [loading, setLoading] = useState(false)
+  const [error,   setError]   = useState<string | null>(null)
+  const [date,    setDate]    = useState('')
+  const [search,  setSearch]  = useState('')
+  const [detail,  setDetail]  = useState<DailyGame | null>(null)
+  const [nSims,   setNSims]   = useState(5_000)
 
-  // filters
-  const [mktType,  setMktType]  = useState('')
-  const [minEdge,  setMinEdge]  = useState('')
-  const [minEV,    setMinEV]    = useState('')
-  const [minStake, setMinStake] = useState('')
-
-  // sort
-  const [sortCol,  setSortCol]  = useState<SortKey>('ev')
-  const [sortDir,  setSortDir]  = useState<SortDir>('desc')
-
-  const load = () => {
+  const load = (sims = nSims) => {
     setLoading(true); setError(null)
-    fetchDailyPredictions(date || undefined)
+    fetchDailyPredictions(date || undefined, sims)
       .then(env => setGames(env.data))
       .catch(e => setError(String(e)))
       .finally(() => setLoading(false))
@@ -97,183 +286,191 @@ export default function SlateTab() {
 
   useEffect(() => { load() }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // flatten games × markets into rows
-  const flat: FlatRow[] = useMemo(() => {
-    const rows: FlatRow[] = []
-    for (const g of games) {
-      for (const m of g.markets) {
-        rows.push({
-          ...m,
-          game_pk:   g.game_pk,
-          matchup:   `${g.away_team} @ ${g.home_team}`,
-          game_date: g.game_date,
-        })
-      }
-    }
-    return rows
-  }, [games])
-
-  // filter
   const filtered = useMemo(() => {
-    const edgeMin  = parseFloat(minEdge)  / 100
-    const evMin    = parseFloat(minEV)    / 100
-    const stakeMin = parseFloat(minStake)
-    return flat.filter(r => {
-      if (mktType && !r.market.startsWith(mktType)) return false
-      if (!isNaN(edgeMin)  && (r.edge  ?? -Infinity) < edgeMin)  return false
-      if (!isNaN(evMin)    && (r.ev    ?? -Infinity) < evMin)    return false
-      if (!isNaN(stakeMin) && (r.stake_units ?? -Infinity) < stakeMin) return false
-      return true
-    })
-  }, [flat, mktType, minEdge, minEV, minStake])
+    const q = search.toLowerCase().trim()
+    if (!q) return games
+    return games.filter(g =>
+      g.home_team.toLowerCase().includes(q) ||
+      g.away_team.toLowerCase().includes(q) ||
+      g.home_probable_pitcher.toLowerCase().includes(q) ||
+      g.away_probable_pitcher.toLowerCase().includes(q)
+    )
+  }, [games, search])
 
-  // sort
+  // Sort: highest confidence (furthest from 50/50) first
   const sorted = useMemo(() => {
     return [...filtered].sort((a, b) => {
-      let av: number | string | null = null
-      let bv: number | string | null = null
-      if (sortCol === 'game') { av = a.matchup; bv = b.matchup }
-      else { av = a[sortCol] as number | null; bv = b[sortCol] as number | null }
-      if (av === null || av === undefined) return 1
-      if (bv === null || bv === undefined) return -1
-      const cmp = av < bv ? -1 : av > bv ? 1 : 0
-      return sortDir === 'asc' ? cmp : -cmp
+      const ca = Math.abs(a.simulation.home_win_prob - 0.5)
+      const cb = Math.abs(b.simulation.home_win_prob - 0.5)
+      return cb - ca
     })
-  }, [filtered, sortCol, sortDir])
+  }, [filtered])
 
-  const toggleSort = (col: SortKey) => {
-    if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
-    else { setSortCol(col); setSortDir('desc') }
-  }
-
-  // open detail modal: find the game and derive total line from market keys
-  const openDetail = (row: FlatRow) => {
-    const game = games.find(g => g.game_pk === row.game_pk)
-    if (!game) return
-    const totalKey = Object.keys(game.simulation.totals)[0] ?? ''
-    const lineNum = parseFloat(totalKey.replace(/[^0-9.]/g, '')) || 8.5
-    setDetail({ game, totalLine: lineNum })
-  }
+  const totalMarkets = games.reduce((s, g) => s + g.markets.length, 0)
+  const positiveEV   = games.reduce((s, g) =>
+    s + g.markets.filter(m => (m.ev ?? 0) > 0.01).length, 0)
 
   return (
-    <div>
+    <div style={{ maxWidth: 900 }}>
+      {/* ── Page header ─────────────────────────────────────────────── */}
+      <div style={{ marginBottom: 24 }}>
+        <h1 style={{ fontSize: 22, fontWeight: 800, color: '#fff', margin: 0 }}>
+          Today's Slate
+        </h1>
+        <p style={{ color: '#5a6072', fontSize: 13, marginTop: 4 }}>
+          Monte Carlo game simulations · Bayesian matchup priors · Kelly-sized opportunities
+        </p>
+      </div>
+
+      {/* ── Summary strip ───────────────────────────────────────────── */}
+      {!loading && games.length > 0 && (
+        <div style={{
+          display: 'flex', gap: 12, marginBottom: 20,
+        }}>
+          {[
+            { label: 'Games today',    val: games.length },
+            { label: 'Markets analysed', val: totalMarkets },
+            { label: '+EV opportunities', val: positiveEV, color: positiveEV > 0 ? '#34d399' : '#6b7280' },
+            { label: 'Simulations / game', val: nSims.toLocaleString() },
+          ].map(s => (
+            <div key={s.label} style={{
+              flex: 1, background: '#1a1d27', border: '1px solid #262a36',
+              borderRadius: 10, padding: '12px 16px',
+            }}>
+              <div style={{ fontSize: 18, fontWeight: 800, color: (s as any).color ?? '#fff' }}>
+                {s.val}
+              </div>
+              <div style={{ ...S.label, marginTop: 2 }}>{s.label}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* ── Controls ────────────────────────────────────────────────── */}
-      <div className="flex flex-wrap gap-2 mb-4 items-end">
-        <label className="flex flex-col gap-0.5 text-xs text-muted">
-          Date
+      <div style={{ display: 'flex', gap: 10, marginBottom: 20, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+
+        {/* Search */}
+        <div style={{ flex: 2, minWidth: 180 }}>
+          <div style={{ ...S.label, marginBottom: 5 }}>Search team or pitcher</div>
+          <input
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder="e.g. Dodgers, Cole, Yankees…"
+            style={{
+              width: '100%', background: '#1a1d27', border: '1px solid #2e3345',
+              borderRadius: 8, padding: '8px 12px', color: '#e8eaf0', fontSize: 13,
+              outline: 'none', boxSizing: 'border-box',
+            }}
+          />
+        </div>
+
+        {/* Date */}
+        <div style={{ flex: 1, minWidth: 140 }}>
+          <div style={{ ...S.label, marginBottom: 5 }}>Date</div>
           <input
             type="date" value={date} onChange={e => setDate(e.target.value)}
-            className="border border-border rounded px-2 py-1.5 text-sm text-gray-800 bg-white focus:outline-none focus:ring-1 focus:ring-brand"
+            style={{
+              width: '100%', background: '#1a1d27', border: '1px solid #2e3345',
+              borderRadius: 8, padding: '8px 10px', color: '#e8eaf0', fontSize: 13,
+              outline: 'none', boxSizing: 'border-box',
+              colorScheme: 'dark',
+            }}
           />
-        </label>
+        </div>
 
-        <label className="flex flex-col gap-0.5 text-xs text-muted">
-          Market type
+        {/* Sim quality */}
+        <div>
+          <div style={{ ...S.label, marginBottom: 5 }}>Sim quality</div>
           <select
-            value={mktType} onChange={e => setMktType(e.target.value)}
-            className="border border-border rounded px-2 py-1.5 text-sm text-gray-800 bg-white focus:outline-none focus:ring-1 focus:ring-brand"
+            value={nSims}
+            onChange={e => setNSims(Number(e.target.value))}
+            style={{
+              background: '#1a1d27', border: '1px solid #2e3345',
+              borderRadius: 8, padding: '8px 10px', color: '#e8eaf0',
+              fontSize: 13, cursor: 'pointer', outline: 'none',
+            }}
           >
-            {MARKET_TYPE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            <option value={1000}>1 k — fast preview</option>
+            <option value={5000}>5 k — standard</option>
+            <option value={20000}>20 k — precise</option>
+            <option value={50000}>50 k — max precision</option>
           </select>
-        </label>
+        </div>
 
-        {[
-          { label: 'Min edge %', value: minEdge, set: setMinEdge, ph: 'e.g. 2' },
-          { label: 'Min EV %',   value: minEV,   set: setMinEV,   ph: 'e.g. 1' },
-          { label: 'Min stake $', value: minStake, set: setMinStake, ph: 'e.g. 10' },
-        ].map(f => (
-          <label key={f.label} className="flex flex-col gap-0.5 text-xs text-muted">
-            {f.label}
-            <input
-              type="number" value={f.value} onChange={e => f.set(e.target.value)}
-              placeholder={f.ph}
-              className="border border-border rounded px-2 py-1.5 text-sm text-gray-800 bg-white w-24 focus:outline-none focus:ring-1 focus:ring-brand"
-            />
-          </label>
-        ))}
-
+        {/* Run button */}
         <button
-          onClick={load}
-          className="self-end bg-brand text-white text-sm font-semibold px-4 py-1.5 rounded hover:bg-blue-700 active:scale-95 transition-all"
+          onClick={() => load(nSims)}
+          disabled={loading}
+          style={{
+            background: loading ? '#1e3358' : '#1e5fc2',
+            color: loading ? '#4faeff66' : '#fff',
+            border: 'none', borderRadius: 8, padding: '8px 20px',
+            fontWeight: 700, fontSize: 13.5, cursor: loading ? 'not-allowed' : 'pointer',
+            alignSelf: 'flex-end', whiteSpace: 'nowrap',
+          }}
         >
-          {loading ? 'Loading…' : 'Refresh'}
+          {loading ? '⏳ Simulating…' : '▶ Run Analysis'}
         </button>
       </div>
 
       {/* ── Error ───────────────────────────────────────────────────── */}
       {error && (
-        <div className="mb-3 bg-red-50 border border-red-200 text-red-700 text-sm px-3 py-2 rounded">
+        <div style={{
+          background: '#2a0f0f', border: '1px solid #7f1d1d', borderRadius: 8,
+          padding: '10px 14px', color: '#f87171', fontSize: 13, marginBottom: 16,
+        }}>
           ⚠ {error}
         </div>
       )}
 
-      {/* ── Summary bar ─────────────────────────────────────────────── */}
-      {!loading && sorted.length > 0 && (
-        <p className="text-xs text-muted mb-2">
-          {sorted.length} market{sorted.length !== 1 ? 's' : ''} across {games.length} game{games.length !== 1 ? 's' : ''}
-          {(minEdge || minEV || mktType || minStake) ? ' (filtered)' : ''}
-        </p>
+      {/* ── Loading skeleton ────────────────────────────────────────── */}
+      {loading && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          {[1, 2, 3].map(i => (
+            <div key={i} style={{
+              ...S.card, height: 200,
+              background: 'linear-gradient(90deg, #1a1d27 25%, #1e2130 50%, #1a1d27 75%)',
+              backgroundSize: '200% 100%',
+              animation: 'pulse 1.4s ease-in-out infinite',
+            }} />
+          ))}
+          <style>{`@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }`}</style>
+        </div>
       )}
 
-      {/* ── Table ───────────────────────────────────────────────────── */}
-      <div className="rounded-lg border border-border bg-white overflow-x-auto shadow-sm">
-        <table className="w-full text-sm border-collapse">
-          <thead className="bg-gray-50 border-b border-border">
-            <tr>
-              <SortHeader label="Game"         col="game"         sortCol={sortCol} sortDir={sortDir} onSort={toggleSort} />
-              <SortHeader label="Market"       col="label"        sortCol={sortCol} sortDir={sortDir} onSort={toggleSort} />
-              <SortHeader label="Model %"      col="model_prob"   sortCol={sortCol} sortDir={sortDir} onSort={toggleSort} />
-              <SortHeader label="Market %"     col="market_prob"  sortCol={sortCol} sortDir={sortDir} onSort={toggleSort} />
-              <SortHeader label="Odds"         col="market_odds"  sortCol={sortCol} sortDir={sortDir} onSort={toggleSort} />
-              <SortHeader label="Edge"         col="edge"         sortCol={sortCol} sortDir={sortDir} onSort={toggleSort} />
-              <SortHeader label="EV"           col="ev"           sortCol={sortCol} sortDir={sortDir} onSort={toggleSort} />
-              <SortHeader label="Full Kelly"   col="kelly_full"   sortCol={sortCol} sortDir={sortDir} onSort={toggleSort} />
-              <SortHeader label="¼K Stake"     col="stake_units"  sortCol={sortCol} sortDir={sortDir} onSort={toggleSort} />
-            </tr>
-          </thead>
-          <tbody>
-            {loading && (
-              <tr><td colSpan={9} className="text-center py-10 text-muted text-sm">Loading…</td></tr>
-            )}
-            {!loading && sorted.length === 0 && (
-              <tr><td colSpan={9} className="text-center py-10 text-muted text-sm">
-                {games.length === 0 ? 'No games — click Refresh.' : 'No markets match the current filters.'}
-              </td></tr>
-            )}
-            {sorted.map((r, i) => (
-              <tr
-                key={`${r.game_pk}-${r.market}`}
-                className={[
-                  'border-b border-gray-50 cursor-pointer',
-                  i % 2 === 0 ? 'bg-white' : 'bg-gray-50/50',
-                  'hover:bg-brand-50 transition-colors',
-                ].join(' ')}
-                onClick={() => openDetail(r)}
-              >
-                <td className="px-3 py-2 font-medium text-gray-800 whitespace-nowrap">{r.matchup}</td>
-                <td className="px-3 py-2 text-muted whitespace-nowrap">{r.label}</td>
-                <td className="px-3 py-2 tabular-nums">{pct(r.model_prob)}</td>
-                <td className="px-3 py-2 tabular-nums">{pct(r.market_prob)}</td>
-                <td className="px-3 py-2 tabular-nums">{odds(r.market_odds)}</td>
-                <td className="px-3 py-2 tabular-nums">{signed(r.edge)}</td>
-                <td className="px-3 py-2 tabular-nums">{signed(r.ev)}</td>
-                <td className="px-3 py-2 tabular-nums">{pct(r.kelly_full, 2)}</td>
-                <td className="px-3 py-2 tabular-nums font-semibold">
-                  {r.stake_units !== null
-                    ? <span className="text-brand">${r.stake_units.toFixed(0)}</span>
-                    : <span className="text-gray-300">—</span>}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      {/* ── Empty state ──────────────────────────────────────────────── */}
+      {!loading && games.length === 0 && !error && (
+        <div style={{
+          textAlign: 'center', padding: '60px 20px',
+          color: '#4b5563', fontSize: 14,
+        }}>
+          <div style={{ fontSize: 40, marginBottom: 12 }}>⚾</div>
+          <div style={{ fontWeight: 600, marginBottom: 6 }}>No games loaded</div>
+          <div style={{ fontSize: 12 }}>Choose a date and click Run Analysis</div>
+        </div>
+      )}
 
-      {/* ── Game detail modal ────────────────────────────────────────── */}
+      {/* ── No search results ────────────────────────────────────────── */}
+      {!loading && games.length > 0 && sorted.length === 0 && (
+        <div style={{ textAlign: 'center', padding: '40px 20px', color: '#4b5563' }}>
+          No games matching "{search}"
+        </div>
+      )}
+
+      {/* ── Game cards — sorted by confidence ──────────────────────── */}
+      {!loading && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          {sorted.map(g => (
+            <GameCard key={g.game_pk} game={g} onSelect={() => setDetail(g)} />
+          ))}
+        </div>
+      )}
+
+      {/* ── Detail modal ─────────────────────────────────────────────── */}
       {detail && (
         <GameDetailModal
-          game={detail.game}
-          defaultTotalLine={detail.totalLine}
+          game={detail}
+          defaultTotalLine={8.5}
           onClose={() => setDetail(null)}
         />
       )}

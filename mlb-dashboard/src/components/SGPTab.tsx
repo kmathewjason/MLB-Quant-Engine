@@ -1,53 +1,102 @@
 /**
- * SGPTab — Same-Game Parlay builder.
- *
- * Build up to 6 legs, call POST /api/predictions/sgp, then display:
- *  - Correlation-adjusted joint prob + Kelly stake
- *  - Naive (independent) joint prob + Kelly stake
- *  - % difference between the two stakes (highlighted)
- *  - Correlation matrix heat map
- *  - Per-leg marginal sim_probs
+ * SGPTab — dark-theme rewrite.
+ * Same-Game Parlay builder: up to 6 legs, correlation-adjusted Kelly vs naive,
+ * correlation matrix heat map, per-leg marginal sim_probs.
  */
 import { useState } from 'react'
 import { fetchSGP } from '../api'
 import type { SGPLeg, SGPData, KellyVariant } from '../types'
 
-// ── types ──────────────────────────────────────────────────────────────────
+// ── design tokens ────────────────────────────────────────────────────────────
+const C = {
+  bg:      '#0f1117',
+  surface: '#16181f',
+  card:    '#1c1f29',
+  border:  '#22252e',
+  border2: '#2a2d38',
+  text:    '#e8eaf0',
+  muted:   '#8892a4',
+  muted2:  '#5a6072',
+  accent:  '#4faeff',
+  pos:     '#34d399',
+  neg:     '#f87171',
+  amber:   '#fbbf24',
+}
 
+// ── types ────────────────────────────────────────────────────────────────────
 type Outcome = SGPLeg['outcome']
 type Side    = SGPLeg['side']
 
 interface LegDraft {
-  side: Side
+  side:    Side
   outcome: Outcome
-  line: string
-  odds: string
-  label: string
+  line:    string
+  odds:    string
+  label:   string
 }
 
 const SIDES:    Side[]    = ['home', 'away']
 const OUTCOMES: Outcome[] = ['moneyline', 'over', 'under', 'spread']
 const emptyLeg = (): LegDraft => ({ side: 'home', outcome: 'moneyline', line: '', odds: '-110', label: '' })
 
-// ── small helpers ──────────────────────────────────────────────────────────
-
+// ── helpers ──────────────────────────────────────────────────────────────────
 function pct(v: number, d = 2) { return `${(v * 100).toFixed(d)}%` }
 
-function CorrCell({ v, isdiag }: { v: number; isdiag: boolean }) {
-  if (isdiag) return <td className="px-3 py-1.5 text-center text-xs bg-gray-100 font-semibold">1.00</td>
-  const abs = Math.abs(v)
-  const bg  = v >= 0
-    ? `rgba(37,99,235,${(abs * 0.45).toFixed(2)})`
-    : `rgba(220,38,38,${(abs * 0.45).toFixed(2)})`
+// ── SectionHeader ─────────────────────────────────────────────────────────────
+function SectionHeader({ children }: { children: React.ReactNode }) {
   return (
-    <td className="px-3 py-1.5 text-center text-xs font-mono" style={{ background: bg }}>
-      {v.toFixed(3)}
-    </td>
+    <div style={{
+      fontSize: 11, fontWeight: 700, color: C.muted,
+      textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 12,
+    }}>
+      {children}
+    </div>
   )
 }
 
-// ── Kelly comparison card ──────────────────────────────────────────────────
+// ── small input ───────────────────────────────────────────────────────────────
+function Field({ label, value, onChange, placeholder, width }: {
+  label: string; value: string; onChange: (v: string) => void;
+  placeholder?: string; width?: number | string
+}) {
+  return (
+    <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <span style={{ fontSize: 10, fontWeight: 600, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.07em' }}>
+        {label}
+      </span>
+      <input
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        placeholder={placeholder}
+        style={{
+          width, background: C.card, border: `1px solid ${C.border2}`,
+          borderRadius: 6, padding: '6px 10px', fontSize: 13, color: C.text,
+          outline: 'none',
+        }}
+      />
+    </label>
+  )
+}
 
+// ── select ────────────────────────────────────────────────────────────────────
+function Select({ value, onChange, options }: {
+  value: string; onChange: (v: string) => void; options: string[]
+}) {
+  return (
+    <select
+      value={value}
+      onChange={e => onChange(e.target.value)}
+      style={{
+        background: C.card, border: `1px solid ${C.border2}`, borderRadius: 6,
+        padding: '5px 8px', fontSize: 12, color: C.text, cursor: 'pointer',
+      }}
+    >
+      {options.map(o => <option key={o} value={o}>{o}</option>)}
+    </select>
+  )
+}
+
+// ── Kelly comparison card ─────────────────────────────────────────────────────
 function KellyComparison({
   corrVariant, naiveVariant, bankroll,
 }: {
@@ -55,74 +104,101 @@ function KellyComparison({
   naiveVariant: KellyVariant
   bankroll: number
 }) {
-  const diff = corrVariant.stake_units - naiveVariant.stake_units
+  const diff    = corrVariant.stake_units - naiveVariant.stake_units
   const diffPct = naiveVariant.stake_units > 0
     ? (diff / naiveVariant.stake_units) * 100
     : null
 
   return (
-    <div className="grid grid-cols-2 gap-4 mb-4">
-      {/* Corr-adjusted */}
-      <div className="rounded-lg border-2 border-brand bg-brand-50 p-4">
-        <div className="text-xs font-semibold text-brand uppercase tracking-wide mb-2">
-          Corr-adjusted (model)
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 20 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+
+        {/* Corr-adjusted — primary */}
+        <div style={{
+          background: C.card,
+          border: `2px solid ${C.accent}`,
+          borderRadius: 12, padding: '16px 18px',
+        }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: C.accent, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8 }}>
+            Corr-adjusted (model)
+          </div>
+          <div style={{ fontSize: 28, fontWeight: 800, color: C.accent, fontVariantNumeric: 'tabular-nums' }}>
+            ${corrVariant.stake_units.toFixed(0)}
+          </div>
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>
+            p = {pct(corrVariant.f_star)} full Kelly → ¼K
+          </div>
+          <div style={{ marginTop: 6, fontSize: 12, fontWeight: 600, color: corrVariant.ev >= 0 ? C.pos : C.neg }}>
+            EV {corrVariant.ev >= 0 ? '+' : ''}{(corrVariant.ev * 100).toFixed(2)}%
+          </div>
         </div>
-        <div className="text-3xl font-bold text-brand">
-          ${corrVariant.stake_units.toFixed(0)}
-        </div>
-        <div className="text-xs text-muted mt-1">
-          p = {pct(corrVariant.f_star)} full Kelly → ¼K
-        </div>
-        <div className={`mt-2 text-xs font-medium ${corrVariant.ev >= 0 ? 'text-pos' : 'text-neg'}`}>
-          EV {corrVariant.ev >= 0 ? '+' : ''}{(corrVariant.ev * 100).toFixed(2)}%
+
+        {/* Naive — secondary */}
+        <div style={{
+          background: C.card, border: `1px solid ${C.border}`,
+          borderRadius: 12, padding: '16px 18px',
+        }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8 }}>
+            Naive (independent)
+          </div>
+          <div style={{ fontSize: 28, fontWeight: 800, color: C.muted, fontVariantNumeric: 'tabular-nums' }}>
+            ${naiveVariant.stake_units.toFixed(0)}
+          </div>
+          <div style={{ fontSize: 11, color: C.muted2, marginTop: 4 }}>
+            p = {pct(naiveVariant.f_star)} full Kelly → ¼K
+          </div>
+          <div style={{ marginTop: 6, fontSize: 12, fontWeight: 600, color: naiveVariant.ev >= 0 ? C.pos : C.neg }}>
+            EV {naiveVariant.ev >= 0 ? '+' : ''}{(naiveVariant.ev * 100).toFixed(2)}%
+          </div>
         </div>
       </div>
 
-      {/* Naive */}
-      <div className="rounded-lg border border-border bg-white p-4">
-        <div className="text-xs font-semibold text-muted uppercase tracking-wide mb-2">
-          Naive (independent legs)
-        </div>
-        <div className="text-3xl font-bold text-gray-600">
-          ${naiveVariant.stake_units.toFixed(0)}
-        </div>
-        <div className="text-xs text-muted mt-1">
-          p = {pct(naiveVariant.f_star)} full Kelly → ¼K
-        </div>
-        <div className={`mt-2 text-xs font-medium ${naiveVariant.ev >= 0 ? 'text-pos' : 'text-neg'}`}>
-          EV {naiveVariant.ev >= 0 ? '+' : ''}{(naiveVariant.ev * 100).toFixed(2)}%
-        </div>
-      </div>
-
-      {/* Correlation value callout — spans full width */}
+      {/* Correlation value callout */}
       {diffPct !== null && (
-        <div className={[
-          'col-span-2 rounded-lg px-4 py-3 flex items-center justify-between text-sm',
-          Math.abs(diffPct) > 5
-            ? 'bg-amber-50 border border-amber-200'
-            : 'bg-gray-50 border border-border',
-        ].join(' ')}>
-          <span className="font-medium text-gray-700">
+        <div style={{
+          background: Math.abs(diffPct) > 5 ? '#26200e' : C.card,
+          border: `1px solid ${Math.abs(diffPct) > 5 ? C.amber : C.border}`,
+          borderRadius: 10, padding: '10px 16px',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: C.text }}>
             Correlation model value
           </span>
-          <span className={[
-            'font-bold text-base',
-            diff > 0 ? 'text-pos' : diff < 0 ? 'text-neg' : 'text-gray-500',
-          ].join(' ')}>
+          <span style={{ fontSize: 15, fontWeight: 800, color: diff > 0 ? C.pos : diff < 0 ? C.neg : C.muted }}>
             {diff >= 0 ? '+' : ''}${diff.toFixed(0)}&nbsp;
             ({diffPct >= 0 ? '+' : ''}{diffPct.toFixed(1)}% vs naive)
           </span>
-          <span className="text-xs text-muted">
-            {bankroll} unit bankroll
-          </span>
+          <span style={{ fontSize: 11, color: C.muted2 }}>{bankroll} unit bankroll</span>
         </div>
       )}
     </div>
   )
 }
 
-// ── main component ─────────────────────────────────────────────────────────
+// ── correlation cell ──────────────────────────────────────────────────────────
+function CorrCell({ v, isdiag }: { v: number; isdiag: boolean }) {
+  if (isdiag) {
+    return (
+      <td style={{ padding: '6px 12px', textAlign: 'center', fontSize: 11, fontWeight: 700, color: C.muted }}>
+        1.00
+      </td>
+    )
+  }
+  const abs = Math.abs(v)
+  const bg  = v >= 0
+    ? `rgba(79,174,255,${(abs * 0.5).toFixed(2)})`
+    : `rgba(248,113,113,${(abs * 0.5).toFixed(2)})`
+  return (
+    <td style={{
+      padding: '6px 12px', textAlign: 'center', fontSize: 11,
+      fontFamily: 'monospace', background: bg, color: C.text,
+    }}>
+      {v.toFixed(3)}
+    </td>
+  )
+}
 
+// ── main component ────────────────────────────────────────────────────────────
 export default function SGPTab() {
   const [gameId,   setGameId]   = useState('')
   const [bankroll, setBankroll] = useState('1000')
@@ -156,100 +232,135 @@ export default function SGPTab() {
   }
 
   return (
-    <div className="max-w-2xl">
-      {/* ── Input panel ─────────────────────────────────────────────── */}
-      <div className="bg-white rounded-lg border border-border shadow-sm p-4 mb-4">
-        <h2 className="text-sm font-semibold text-gray-700 mb-3">Parlay parameters</h2>
+    <div style={{ maxWidth: 680 }}>
 
-        <div className="flex flex-wrap gap-3 mb-4 items-end">
-          {[
-            { label: 'Game PK',    v: gameId,   set: setGameId,   ph: 'e.g. 718976', w: 'w-28' },
-            { label: 'Bankroll $', v: bankroll, set: setBankroll, ph: '1000',         w: 'w-24' },
-            { label: '# Sims',     v: nSims,    set: setNSims,    ph: '20000',        w: 'w-24' },
-          ].map(f => (
-            <label key={f.label} className="flex flex-col gap-0.5 text-xs text-muted">
-              {f.label}
-              <input value={f.v} onChange={e => f.set(e.target.value)} placeholder={f.ph}
-                className={`border border-border rounded px-2 py-1.5 text-sm bg-white ${f.w} focus:outline-none focus:ring-1 focus:ring-brand`}
-              />
-            </label>
-          ))}
+      {/* ── Input panel ──────────────────────────────────────────────── */}
+      <div style={{
+        background: C.surface, border: `1px solid ${C.border}`,
+        borderRadius: 12, padding: '18px 20px', marginBottom: 16,
+      }}>
+        <SectionHeader>Parlay parameters</SectionHeader>
+
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14, marginBottom: 18, alignItems: 'flex-end' }}>
+          <Field label="Game PK"    value={gameId}   onChange={setGameId}   placeholder="e.g. 718976" width={110} />
+          <Field label="Bankroll $" value={bankroll} onChange={setBankroll} placeholder="1000"        width={90}  />
+          <Field label="# Sims"     value={nSims}    onChange={setNSims}    placeholder="20000"       width={90}  />
         </div>
 
-        <h3 className="text-xs font-semibold text-muted uppercase tracking-wide mb-2">Legs</h3>
-        <div className="space-y-2 mb-3">
+        <SectionHeader>Legs</SectionHeader>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 14 }}>
           {legs.map((leg, i) => (
-            <div key={i} className="flex flex-wrap gap-2 items-center bg-gray-50 rounded-lg px-3 py-2">
-              <span className="text-xs font-mono text-muted w-5">#{i + 1}</span>
+            <div key={i} style={{
+              display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center',
+              background: C.card, border: `1px solid ${C.border}`,
+              borderRadius: 8, padding: '8px 12px',
+            }}>
+              <span style={{ fontSize: 11, fontFamily: 'monospace', color: C.muted2, width: 20 }}>#{i + 1}</span>
 
-              <select value={leg.side} onChange={e => updateLeg(i, 'side', e.target.value)}
-                className="border border-border rounded px-2 py-1 text-xs bg-white focus:outline-none focus:ring-1 focus:ring-brand">
-                {SIDES.map(s => <option key={s} value={s}>{s}</option>)}
-              </select>
-
-              <select value={leg.outcome} onChange={e => updateLeg(i, 'outcome', e.target.value)}
-                className="border border-border rounded px-2 py-1 text-xs bg-white focus:outline-none focus:ring-1 focus:ring-brand">
-                {OUTCOMES.map(o => <option key={o} value={o}>{o}</option>)}
-              </select>
+              <Select value={leg.side}    onChange={v => updateLeg(i, 'side', v)}    options={SIDES} />
+              <Select value={leg.outcome} onChange={v => updateLeg(i, 'outcome', v)} options={OUTCOMES} />
 
               {['over', 'under', 'spread'].includes(leg.outcome) && (
-                <input placeholder="Line" value={leg.line} onChange={e => updateLeg(i, 'line', e.target.value)}
-                  className="border border-border rounded px-2 py-1 text-xs bg-white w-16 focus:outline-none focus:ring-1 focus:ring-brand" />
+                <input
+                  placeholder="Line" value={leg.line}
+                  onChange={e => updateLeg(i, 'line', e.target.value)}
+                  style={{
+                    width: 60, background: C.bg, border: `1px solid ${C.border2}`,
+                    borderRadius: 6, padding: '5px 8px', fontSize: 12, color: C.text,
+                  }}
+                />
               )}
 
-              <input placeholder="Odds" value={leg.odds} onChange={e => updateLeg(i, 'odds', e.target.value)}
-                className="border border-border rounded px-2 py-1 text-xs bg-white w-16 focus:outline-none focus:ring-1 focus:ring-brand" />
+              <input
+                placeholder="Odds" value={leg.odds}
+                onChange={e => updateLeg(i, 'odds', e.target.value)}
+                style={{
+                  width: 60, background: C.bg, border: `1px solid ${C.border2}`,
+                  borderRadius: 6, padding: '5px 8px', fontSize: 12, color: C.text,
+                }}
+              />
 
-              <input placeholder="Label" value={leg.label} onChange={e => updateLeg(i, 'label', e.target.value)}
-                className="border border-border rounded px-2 py-1 text-xs bg-white w-24 focus:outline-none focus:ring-1 focus:ring-brand" />
+              <input
+                placeholder="Label" value={leg.label}
+                onChange={e => updateLeg(i, 'label', e.target.value)}
+                style={{
+                  width: 100, background: C.bg, border: `1px solid ${C.border2}`,
+                  borderRadius: 6, padding: '5px 8px', fontSize: 12, color: C.text,
+                }}
+              />
 
               {legs.length > 2 && (
-                <button onClick={() => removeLeg(i)}
-                  className="text-red-400 hover:text-red-600 text-base leading-none ml-1">×</button>
+                <button
+                  onClick={() => removeLeg(i)}
+                  style={{
+                    background: 'none', border: 'none', cursor: 'pointer',
+                    color: C.neg, fontSize: 16, lineHeight: 1, padding: '0 4px',
+                  }}
+                >×</button>
               )}
             </div>
           ))}
         </div>
 
-        <div className="flex gap-2">
+        <div style={{ display: 'flex', gap: 10 }}>
           {legs.length < 6 && (
-            <button onClick={addLeg}
-              className="border border-border rounded px-3 py-1.5 text-xs text-muted hover:bg-gray-50 transition-colors">
+            <button
+              onClick={addLeg}
+              style={{
+                background: 'none', border: `1px solid ${C.border2}`, borderRadius: 7,
+                padding: '7px 14px', fontSize: 12, color: C.muted, cursor: 'pointer',
+              }}
+            >
               + Add leg
             </button>
           )}
-          <button onClick={submit}
-            className="bg-brand text-white text-sm font-semibold px-5 py-1.5 rounded hover:bg-blue-700 active:scale-95 transition-all">
+          <button
+            onClick={submit}
+            style={{
+              background: C.accent, color: '#fff', border: 'none', borderRadius: 7,
+              padding: '7px 22px', fontWeight: 700, fontSize: 13, cursor: 'pointer',
+            }}
+          >
             {loading ? 'Calculating…' : 'Calculate'}
           </button>
         </div>
       </div>
 
-      {/* ── Error ───────────────────────────────────────────────────── */}
+      {/* ── Error ────────────────────────────────────────────────────── */}
       {error && (
-        <div className="mb-4 bg-red-50 border border-red-200 text-red-700 text-sm px-3 py-2 rounded">
+        <div style={{
+          background: '#2a1515', border: '1px solid #6b2020', borderRadius: 8,
+          color: C.neg, fontSize: 13, padding: '10px 14px', marginBottom: 16,
+        }}>
           ⚠ {error}
         </div>
       )}
 
-      {/* ── Results ─────────────────────────────────────────────────── */}
+      {/* ── Results ──────────────────────────────────────────────────── */}
       {result && !loading && (
-        <>
-          {/* Joint probs summary */}
-          <div className="bg-white rounded-lg border border-border shadow-sm px-4 py-3 mb-4 flex flex-wrap gap-5">
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+
+          {/* Joint prob summary strip */}
+          <div style={{
+            background: C.surface, border: `1px solid ${C.border}`,
+            borderRadius: 12, padding: '14px 20px',
+            display: 'flex', flexWrap: 'wrap', gap: 24,
+          }}>
             {[
-              { label: 'Corr-adjusted prob', v: pct(result.joint_prob_corr_adjusted), color: 'text-brand' },
-              { label: 'Naive (independent)', v: pct(result.joint_prob_naive),        color: 'text-gray-500' },
-              { label: 'Net payout (b)',      v: `${result.parlay_net_payout.toFixed(2)}×`, color: 'text-emerald-600' },
+              { label: 'Corr-adjusted prob', v: pct(result.joint_prob_corr_adjusted), color: C.accent },
+              { label: 'Naive (independent)', v: pct(result.joint_prob_naive),         color: C.muted  },
+              { label: 'Net payout (b)',      v: `${result.parlay_net_payout.toFixed(2)}×`, color: C.pos },
             ].map(item => (
               <div key={item.label}>
-                <div className={`text-2xl font-bold ${item.color}`}>{item.v}</div>
-                <div className="text-xs text-muted">{item.label}</div>
+                <div style={{ fontSize: 24, fontWeight: 800, color: item.color, fontVariantNumeric: 'tabular-nums' }}>
+                  {item.v}
+                </div>
+                <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>{item.label}</div>
               </div>
             ))}
           </div>
 
-          {/* Kelly comparison — the main value-add UI */}
+          {/* Kelly comparison */}
           <KellyComparison
             corrVariant={result.kelly.corr_adjusted}
             naiveVariant={result.kelly.naive}
@@ -257,25 +368,33 @@ export default function SGPTab() {
           />
 
           {/* Per-leg marginals */}
-          <div className="bg-white rounded-lg border border-border shadow-sm p-4 mb-4">
-            <h3 className="text-xs font-semibold text-muted uppercase tracking-wide mb-3">Per-leg marginal probabilities</h3>
-            <table className="w-full text-sm">
+          <div style={{
+            background: C.surface, border: `1px solid ${C.border}`,
+            borderRadius: 12, padding: '14px 20px',
+          }}>
+            <SectionHeader>Per-leg marginal probabilities</SectionHeader>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
               <thead>
-                <tr className="border-b border-border">
+                <tr style={{ borderBottom: `1px solid ${C.border}` }}>
                   {['Label', 'Side', 'Outcome', 'Line', 'Odds', 'Sim prob'].map(h => (
-                    <th key={h} className="px-3 py-1.5 text-left text-xs text-muted font-semibold">{h}</th>
+                    <th key={h} style={{ padding: '5px 10px', textAlign: 'left', color: C.muted, fontWeight: 600, whiteSpace: 'nowrap' }}>
+                      {h}
+                    </th>
                   ))}
                 </tr>
               </thead>
               <tbody>
                 {result.legs.map((l, i) => (
-                  <tr key={i} className="border-b border-gray-50">
-                    <td className="px-3 py-1.5 font-medium">{l.label ?? `Leg ${i+1}`}</td>
-                    <td className="px-3 py-1.5 text-muted">{l.side}</td>
-                    <td className="px-3 py-1.5 text-muted">{l.outcome}</td>
-                    <td className="px-3 py-1.5 tabular-nums">{l.line ?? '—'}</td>
-                    <td className="px-3 py-1.5 tabular-nums">{l.odds ?? '—'}</td>
-                    <td className="px-3 py-1.5 tabular-nums font-semibold text-brand">{pct(l.sim_prob)}</td>
+                  <tr key={i} style={{
+                    borderBottom: `1px solid ${C.border}`,
+                    background: i % 2 === 0 ? 'transparent' : '#ffffff06',
+                  }}>
+                    <td style={{ padding: '6px 10px', fontWeight: 600, color: C.text }}>{l.label ?? `Leg ${i + 1}`}</td>
+                    <td style={{ padding: '6px 10px', color: C.muted }}>{l.side}</td>
+                    <td style={{ padding: '6px 10px', color: C.muted }}>{l.outcome}</td>
+                    <td style={{ padding: '6px 10px', fontVariantNumeric: 'tabular-nums', color: C.text }}>{l.line ?? '—'}</td>
+                    <td style={{ padding: '6px 10px', fontVariantNumeric: 'tabular-nums', color: C.text }}>{l.odds ?? '—'}</td>
+                    <td style={{ padding: '6px 10px', fontVariantNumeric: 'tabular-nums', fontWeight: 700, color: C.accent }}>{pct(l.sim_prob)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -283,19 +402,24 @@ export default function SGPTab() {
           </div>
 
           {/* Correlation matrix */}
-          <div className="bg-white rounded-lg border border-border shadow-sm p-4">
-            <h3 className="text-xs font-semibold text-muted uppercase tracking-wide mb-3">
+          <div style={{
+            background: C.surface, border: `1px solid ${C.border}`,
+            borderRadius: 12, padding: '14px 20px',
+          }}>
+            <SectionHeader>
               Correlation matrix
-              <span className="ml-2 font-normal normal-case text-muted">blue = positive, red = negative</span>
-            </h3>
-            <div className="overflow-x-auto">
-              <table className="border-collapse text-xs">
+              <span style={{ fontWeight: 400, marginLeft: 8, textTransform: 'none', letterSpacing: 0 }}>
+                — blue = positive, red = negative
+              </span>
+            </SectionHeader>
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ borderCollapse: 'collapse', fontSize: 12 }}>
                 <thead>
                   <tr>
-                    <th className="px-3 py-1.5 text-left text-muted font-semibold" />
+                    <th style={{ padding: '5px 12px' }} />
                     {result.legs.map((l, i) => (
-                      <th key={i} className="px-3 py-1.5 text-muted font-semibold text-center">
-                        {l.label ?? `L${i+1}`}
+                      <th key={i} style={{ padding: '5px 12px', color: C.muted, fontWeight: 600, textAlign: 'center' }}>
+                        {l.label ?? `L${i + 1}`}
                       </th>
                     ))}
                   </tr>
@@ -303,8 +427,8 @@ export default function SGPTab() {
                 <tbody>
                   {result.correlation_matrix.map((row, ri) => (
                     <tr key={ri}>
-                      <td className="px-3 py-1.5 text-muted font-semibold">
-                        {result.legs[ri]?.label ?? `L${ri+1}`}
+                      <td style={{ padding: '5px 12px', color: C.muted, fontWeight: 600, whiteSpace: 'nowrap' }}>
+                        {result.legs[ri]?.label ?? `L${ri + 1}`}
                       </td>
                       {row.map((v, ci) => (
                         <CorrCell key={ci} v={v} isdiag={ri === ci} />
@@ -315,7 +439,8 @@ export default function SGPTab() {
               </table>
             </div>
           </div>
-        </>
+
+        </div>
       )}
     </div>
   )

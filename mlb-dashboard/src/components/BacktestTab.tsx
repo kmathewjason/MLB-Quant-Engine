@@ -1,9 +1,6 @@
 /**
- * BacktestTab — calibration reliability diagram + CLV summary.
- *
- * Fetches GET /api/backtest/report.
- * Reliability diagram: mean_pred on x-axis, obs_freq on y-axis, per PA-outcome class.
- * Diagonal = perfect calibration reference line.
+ * BacktestTab — dark-theme rewrite.
+ * Walk-forward summary · Calibration reliability diagram · CLV summary.
  */
 import { useState, useEffect } from 'react'
 import {
@@ -13,127 +10,178 @@ import {
 import { fetchBacktestReport } from '../api'
 import type { BacktestData, ReliabilityCurve } from '../types'
 
-// ── palette for multi-class reliability curves ─────────────────────────────
+// ── design tokens ───────────────────────────────────────────────────────────
+const C = {
+  bg:        '#0f1117',
+  surface:   '#16181f',
+  card:      '#1c1f29',
+  border:    '#22252e',
+  border2:   '#2a2d38',
+  text:      '#e8eaf0',
+  muted:     '#8892a4',
+  muted2:    '#5a6072',
+  accent:    '#4faeff',
+  pos:       '#34d399',
+  neg:       '#f87171',
+}
+
 const CLASS_COLORS = [
-  '#2563eb', '#059669', '#d97706', '#7c3aed', '#dc2626', '#0891b2', '#65a30d',
+  '#4faeff', '#34d399', '#fbbf24', '#a78bfa', '#f87171', '#22d3ee', '#86efac',
 ]
 
-// ── sub-components ─────────────────────────────────────────────────────────
+// ── helpers ─────────────────────────────────────────────────────────────────
+function fmt4(v: number | string) { return Number(v).toFixed(4) }
+function fmtPct(v: number | string, d = 1) { return `${(Number(v) * 100).toFixed(d)}%` }
 
-function StatCard({ label, value, sub }: { label: string; value: string; sub?: string }) {
+// ── StatCard ────────────────────────────────────────────────────────────────
+function StatCard({ label, value, sub, accent }: {
+  label: string; value: string; sub?: string; accent?: boolean
+}) {
   return (
-    <div className="bg-gray-50 rounded-lg px-4 py-3 text-center">
-      <div className="text-xl font-bold text-gray-800">{value}</div>
-      <div className="text-xs text-muted mt-0.5">{label}</div>
-      {sub && <div className="text-[10px] text-gray-400 mt-0.5">{sub}</div>}
+    <div style={{
+      background: C.card, border: `1px solid ${C.border}`,
+      borderRadius: 10, padding: '14px 16px', textAlign: 'center',
+    }}>
+      <div style={{
+        fontSize: 20, fontWeight: 700,
+        color: accent ? C.accent : C.text,
+        fontVariantNumeric: 'tabular-nums',
+      }}>
+        {value}
+      </div>
+      <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>{label}</div>
+      {sub && <div style={{ fontSize: 10, color: C.muted2, marginTop: 2 }}>{sub}</div>}
     </div>
   )
 }
 
-/** Reliability diagram for one or more PA-outcome classes. */
+// ── SectionHeader ────────────────────────────────────────────────────────────
+function SectionHeader({ children }: { children: React.ReactNode }) {
+  return (
+    <div style={{
+      fontSize: 11, fontWeight: 700, color: C.muted,
+      textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 12,
+    }}>
+      {children}
+    </div>
+  )
+}
+
+// ── ReliabilityDiagram ───────────────────────────────────────────────────────
 function ReliabilityDiagram({ curves }: { curves: ReliabilityCurve[] }) {
   const [selected, setSelected] = useState<string | null>(null)
 
-  const active = selected
-    ? curves.filter(c => c.class_name === selected)
-    : curves
-
-  // Build scatter data per curve: { mean_pred, obs_freq, class_name }
-  // Recharts Scatter needs a flat array per series, so we render one Scatter per class.
+  const active = selected ? curves.filter(c => c.class_name === selected) : curves
   const diagonal = [{ x: 0, y: 0 }, { x: 1, y: 1 }]
 
   return (
     <div>
-      {/* class selector pills */}
-      <div className="flex flex-wrap gap-1.5 mb-3">
+      {/* Class selector pills */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 14 }}>
         <button
           onClick={() => setSelected(null)}
-          className={[
-            'px-2.5 py-0.5 rounded-full text-xs font-medium transition-colors',
-            selected === null ? 'bg-brand text-white' : 'bg-gray-100 text-muted hover:bg-gray-200',
-          ].join(' ')}
+          style={{
+            padding: '3px 11px', borderRadius: 99, fontSize: 11, fontWeight: 600,
+            border: 'none', cursor: 'pointer',
+            background: selected === null ? C.accent : C.border2,
+            color: selected === null ? '#fff' : C.muted,
+            transition: 'all 0.12s',
+          }}
         >
           All
         </button>
-        {curves.map((c, i) => (
-          <button
-            key={c.class_name}
-            onClick={() => setSelected(s => s === c.class_name ? null : c.class_name)}
-            className={[
-              'px-2.5 py-0.5 rounded-full text-xs font-medium transition-colors',
-              selected === c.class_name
-                ? 'text-white'
-                : 'bg-gray-100 text-muted hover:bg-gray-200',
-            ].join(' ')}
-            style={selected === c.class_name ? { background: CLASS_COLORS[i % CLASS_COLORS.length] } : {}}
-          >
-            {c.class_name} (ECE {(c.ece * 100).toFixed(1)}%)
-          </button>
-        ))}
+        {curves.map((c, i) => {
+          const col = CLASS_COLORS[i % CLASS_COLORS.length]
+          const isActive = selected === c.class_name
+          return (
+            <button
+              key={c.class_name}
+              onClick={() => setSelected(s => s === c.class_name ? null : c.class_name)}
+              style={{
+                padding: '3px 11px', borderRadius: 99, fontSize: 11, fontWeight: 600,
+                border: 'none', cursor: 'pointer',
+                background: isActive ? col : C.border2,
+                color: isActive ? '#fff' : C.muted,
+                transition: 'all 0.12s',
+              }}
+            >
+              {c.class_name}&nbsp;(ECE {(c.ece * 100).toFixed(1)}%)
+            </button>
+          )
+        })}
       </div>
 
       <ResponsiveContainer width="100%" height={280}>
-        <ComposedChart margin={{ top: 8, right: 8, bottom: 16, left: -4 }}>
-          <CartesianGrid stroke="#f3f4f6" />
+        <ComposedChart margin={{ top: 8, right: 8, bottom: 20, left: -4 }}>
+          <CartesianGrid stroke={C.border} strokeDasharray="3 3" />
           <XAxis
             type="number" dataKey="x" domain={[0, 1]}
-            label={{ value: 'Mean predicted prob', position: 'insideBottom', offset: -8, fontSize: 11 }}
-            tick={{ fontSize: 10 }} tickLine={false}
+            label={{ value: 'Mean predicted prob', position: 'insideBottom', offset: -10, fontSize: 10, fill: C.muted }}
+            tick={{ fontSize: 10, fill: C.muted }} tickLine={false}
+            axisLine={{ stroke: C.border }}
           />
           <YAxis
             type="number" dataKey="y" domain={[0, 1]}
-            label={{ value: 'Observed freq', angle: -90, position: 'insideLeft', offset: 14, fontSize: 11 }}
-            tick={{ fontSize: 10 }} tickLine={false} axisLine={false}
+            label={{ value: 'Observed freq', angle: -90, position: 'insideLeft', offset: 14, fontSize: 10, fill: C.muted }}
+            tick={{ fontSize: 10, fill: C.muted }} tickLine={false} axisLine={false}
           />
           <Tooltip
-            contentStyle={{ fontSize: 11 }}
+            contentStyle={{
+              background: C.card, border: `1px solid ${C.border}`,
+              borderRadius: 8, fontSize: 11, color: C.text,
+            }}
             formatter={(v: number, _name: string, props: { payload?: { class_name?: string } }) => [
               `${(v * 100).toFixed(1)}%`,
               props.payload?.class_name ?? 'obs',
             ]}
           />
-          <Legend iconSize={8} wrapperStyle={{ fontSize: 11 }} />
+          <Legend iconSize={8} wrapperStyle={{ fontSize: 11, color: C.muted }} />
 
-          {/* Perfect calibration line */}
+          {/* Perfect calibration diagonal */}
           <Line
             data={diagonal} dataKey="y" dot={false}
-            stroke="#d1d5db" strokeDasharray="4 3" strokeWidth={1.5}
-            name="Perfect calibration" legendType="plainline"
+            stroke={C.muted2} strokeDasharray="5 3" strokeWidth={1.5}
+            name="Perfect cal." legendType="plainline"
           />
 
           {/* One Scatter per class */}
           {active.map((c, i) => {
             const color = CLASS_COLORS[curves.findIndex(cc => cc.class_name === c.class_name) % CLASS_COLORS.length]
             const pts = c.bins.map(b => ({
-              x:          b.mean_pred,
-              y:          b.obs_freq,
-              class_name: c.class_name,
-              count:      b.count,
-              ci_lo:      b.ci_lo_95,
-              ci_hi:      b.ci_hi_95,
+              x: b.mean_pred, y: b.obs_freq,
+              class_name: c.class_name, count: b.count,
+              ci_lo: b.ci_lo_95, ci_hi: b.ci_hi_95,
             }))
             return (
               <Scatter
                 key={c.class_name}
-                data={pts}
-                fill={color}
-                name={c.class_name}
-                shape="circle"
-                r={i === 0 ? 4 : 3}
+                data={pts} fill={color} name={c.class_name}
+                shape="circle" r={i === 0 ? 5 : 4}
               />
             )
           })}
         </ComposedChart>
       </ResponsiveContainer>
-      <p className="text-[10px] text-muted text-center mt-1">
-        Each point = one calibration bin. Dashed diagonal = perfect calibration.
+      <p style={{ fontSize: 10, color: C.muted2, textAlign: 'center', marginTop: 4 }}>
+        Each point = one calibration bin · dashed diagonal = perfect calibration
       </p>
     </div>
   )
 }
 
-// ── main component ─────────────────────────────────────────────────────────
+// ── section card wrapper ─────────────────────────────────────────────────────
+function Card({ children, style }: { children: React.ReactNode; style?: React.CSSProperties }) {
+  return (
+    <section style={{
+      background: C.surface, border: `1px solid ${C.border}`,
+      borderRadius: 12, padding: '18px 20px', ...style,
+    }}>
+      {children}
+    </section>
+  )
+}
 
+// ── main component ───────────────────────────────────────────────────────────
 export default function BacktestTab() {
   const [data,    setData]    = useState<BacktestData | null>(null)
   const [loading, setLoading] = useState(false)
@@ -156,60 +204,85 @@ export default function BacktestTab() {
 
   return (
     <div>
-      <div className="flex items-center gap-3 mb-4">
+      {/* ── toolbar ──────────────────────────────────────────────────── */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 18 }}>
         <button
           onClick={load}
-          className="bg-brand text-white text-sm font-semibold px-4 py-1.5 rounded hover:bg-blue-700 active:scale-95 transition-all"
+          style={{
+            background: C.accent, color: '#fff', border: 'none', borderRadius: 8,
+            padding: '8px 18px', fontWeight: 700, fontSize: 13, cursor: 'pointer',
+          }}
         >
           {loading ? 'Loading…' : 'Refresh'}
         </button>
         {data && (
-          <span className="text-xs text-muted">
-            Last updated: {new Date().toLocaleTimeString()}
+          <span style={{ fontSize: 11, color: C.muted }}>
+            Updated {new Date().toLocaleTimeString()}
           </span>
         )}
       </div>
 
+      {/* ── error ────────────────────────────────────────────────────── */}
       {error && (
-        <div className="mb-4 bg-red-50 border border-red-200 text-red-700 text-sm px-3 py-2 rounded">
+        <div style={{
+          background: '#2a1515', border: '1px solid #6b2020', borderRadius: 8,
+          color: C.neg, fontSize: 13, padding: '10px 14px', marginBottom: 16,
+        }}>
           ⚠ {error}
         </div>
       )}
 
+      {/* ── loading skeleton ─────────────────────────────────────────── */}
       {loading && (
-        <div className="text-center py-10 text-muted text-sm">Loading backtest data…</div>
+        <div style={{ textAlign: 'center', padding: '48px 0', color: C.muted, fontSize: 13 }}>
+          Loading backtest data…
+        </div>
       )}
 
+      {/* ── content ──────────────────────────────────────────────────── */}
       {data && !loading && (
-        <div className="space-y-4">
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
 
-          {/* ── Walk-forward summary ─────────────────────────────────── */}
+          {/* Walk-forward summary */}
           {data.walk_forward.available && data.walk_forward.summary && (
-            <section className="bg-white rounded-lg border border-border shadow-sm p-4">
-              <h2 className="text-sm font-semibold text-gray-700 mb-3">Walk-forward summary</h2>
-              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-                <StatCard label="Folds"         value={String(data.walk_forward.summary.n_folds)} />
-                <StatCard label="OOS predictions" value={data.walk_forward.summary.n_oos_predictions.toLocaleString()} />
-                <StatCard label="OOS log-loss"  value={data.walk_forward.summary.oos_log_loss.toFixed(4)} />
-                <StatCard label="OOS accuracy"  value={`${(data.walk_forward.summary.oos_accuracy * 100).toFixed(1)}%`} />
-                <StatCard label="Mean Brier"    value={data.walk_forward.summary.mean_fold_brier.toFixed(4)} />
+            <Card>
+              <SectionHeader>Walk-forward summary</SectionHeader>
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fill, minmax(130px, 1fr))',
+                gap: 10,
+              }}>
+                <StatCard label="Folds"
+                  value={String(data.walk_forward.summary.n_folds)} />
+                <StatCard label="OOS predictions"
+                  value={data.walk_forward.summary.n_oos_predictions.toLocaleString()} />
+                <StatCard label="OOS log-loss"
+                  value={fmt4(data.walk_forward.summary.oos_log_loss)} />
+                <StatCard label="OOS accuracy"
+                  value={fmtPct(data.walk_forward.summary.oos_accuracy)} accent />
+                <StatCard label="Mean Brier"
+                  value={fmt4(data.walk_forward.summary.mean_fold_brier)} />
               </div>
-            </section>
+            </Card>
           )}
 
-          {/* ── Calibration reliability diagram ─────────────────────── */}
+          {/* Calibration */}
           {data.calibration.available && (
-            <section className="bg-white rounded-lg border border-border shadow-sm p-4">
-              <h2 className="text-sm font-semibold text-gray-700 mb-1">Calibration</h2>
+            <Card>
+              <SectionHeader>Calibration</SectionHeader>
 
-              {/* Brier decomposition */}
+              {/* Brier decomposition stat strip */}
               {data.calibration.brier_decomposition && (
-                <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-4">
+                <div style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fill, minmax(120px, 1fr))',
+                  gap: 10, marginBottom: 20,
+                }}>
                   {(Object.entries(data.calibration.brier_decomposition) as [string, number][]).map(([k, v]) => (
                     <StatCard
                       key={k}
                       label={k.replace(/_/g, ' ')}
-                      value={v.toFixed(4)}
+                      value={fmt4(v)}
                     />
                   ))}
                 </div>
@@ -218,98 +291,131 @@ export default function BacktestTab() {
               {/* Reliability diagram */}
               {data.calibration.reliability_curves && data.calibration.reliability_curves.length > 0 ? (
                 <>
-                  <h3 className="text-xs font-semibold text-muted uppercase tracking-wide mb-2">
+                  <div style={{
+                    fontSize: 11, fontWeight: 600, color: C.muted,
+                    textTransform: 'uppercase', letterSpacing: '0.08em',
+                    marginBottom: 10,
+                  }}>
                     Reliability diagram
-                  </h3>
+                    <span style={{ fontWeight: 400, marginLeft: 8, textTransform: 'none', letterSpacing: 0 }}>
+                      — blue = positive corr, red = negative
+                    </span>
+                  </div>
                   <ReliabilityDiagram curves={data.calibration.reliability_curves} />
                 </>
               ) : (
-                <p className="text-xs text-muted">
+                <p style={{ fontSize: 12, color: C.muted, margin: 0 }}>
                   Reliability curves not available (need wf_predictions.parquet in data/predictions/).
                 </p>
               )}
 
               {/* Per-class calibration table */}
               {data.calibration.report.length > 0 && (
-                <div className="mt-4 overflow-x-auto">
-                  <h3 className="text-xs font-semibold text-muted uppercase tracking-wide mb-2">
+                <div style={{ marginTop: 20, overflowX: 'auto' }}>
+                  <div style={{
+                    fontSize: 11, fontWeight: 600, color: C.muted,
+                    textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8,
+                  }}>
                     Per-class calibration
-                  </h3>
-                  <table className="w-full text-xs border-collapse">
+                  </div>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
                     <thead>
-                      <tr className="border-b border-border">
+                      <tr style={{ borderBottom: `1px solid ${C.border}` }}>
                         {['Class', 'ECE', 'Brier', 'Reliability', 'Resolution', 'BSS', 'Base rate', 'N+'].map(h => (
-                          <th key={h} className="px-3 py-1.5 text-left text-muted font-semibold whitespace-nowrap">{h}</th>
+                          <th key={h} style={{
+                            padding: '6px 12px', textAlign: 'left',
+                            color: C.muted, fontWeight: 600, whiteSpace: 'nowrap',
+                          }}>
+                            {h}
+                          </th>
                         ))}
                       </tr>
                     </thead>
                     <tbody>
                       {data.calibration.report.map((r, i) => (
-                        <tr key={i} className="border-b border-gray-50">
-                          <td className="px-3 py-1.5 font-semibold">{r.class_name}</td>
-                          <td className="px-3 py-1.5 tabular-nums">{Number(r.ece).toFixed(4)}</td>
-                          <td className="px-3 py-1.5 tabular-nums">{Number(r.brier_score).toFixed(4)}</td>
-                          <td className="px-3 py-1.5 tabular-nums">{Number(r.reliability).toFixed(4)}</td>
-                          <td className="px-3 py-1.5 tabular-nums">{Number(r.resolution).toFixed(4)}</td>
-                          <td className="px-3 py-1.5 tabular-nums">{Number(r.brier_skill_score).toFixed(3)}</td>
-                          <td className="px-3 py-1.5 tabular-nums">{(Number(r.base_rate) * 100).toFixed(1)}%</td>
-                          <td className="px-3 py-1.5 tabular-nums">{r.n_positive}</td>
+                        <tr key={i} style={{
+                          borderBottom: `1px solid ${C.border}`,
+                          background: i % 2 === 0 ? 'transparent' : '#ffffff06',
+                        }}>
+                          <td style={{ padding: '7px 12px', fontWeight: 600, color: CLASS_COLORS[i % CLASS_COLORS.length] }}>
+                            {r.class_name}
+                          </td>
+                          <td style={{ padding: '7px 12px', fontVariantNumeric: 'tabular-nums', color: C.text }}>
+                            {fmt4(r.ece)}
+                          </td>
+                          <td style={{ padding: '7px 12px', fontVariantNumeric: 'tabular-nums', color: C.text }}>
+                            {fmt4(r.brier_score)}
+                          </td>
+                          <td style={{ padding: '7px 12px', fontVariantNumeric: 'tabular-nums', color: C.text }}>
+                            {fmt4(r.reliability)}
+                          </td>
+                          <td style={{ padding: '7px 12px', fontVariantNumeric: 'tabular-nums', color: C.text }}>
+                            {fmt4(r.resolution)}
+                          </td>
+                          <td style={{ padding: '7px 12px', fontVariantNumeric: 'tabular-nums', color: C.text }}>
+                            {Number(r.brier_skill_score).toFixed(3)}
+                          </td>
+                          <td style={{ padding: '7px 12px', fontVariantNumeric: 'tabular-nums', color: C.text }}>
+                            {fmtPct(r.base_rate)}
+                          </td>
+                          <td style={{ padding: '7px 12px', fontVariantNumeric: 'tabular-nums', color: C.muted }}>
+                            {r.n_positive}
+                          </td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
                 </div>
               )}
-            </section>
+            </Card>
           )}
 
-          {/* ── CLV summary ──────────────────────────────────────────── */}
+          {/* CLV summary */}
           {data.clv.available && data.clv.summary && (
-            <section className="bg-white rounded-lg border border-border shadow-sm p-4">
-              <h2 className="text-sm font-semibold text-gray-700 mb-3">Closing-line value</h2>
-              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-                <StatCard label="Total bets"      value={data.clv.summary.n_bets.toLocaleString()} />
-                <StatCard
-                  label="% Positive CLV"
+            <Card>
+              <SectionHeader>Closing-line value</SectionHeader>
+              <div style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))',
+                gap: 10,
+              }}>
+                <StatCard label="Total bets"
+                  value={data.clv.summary.n_bets.toLocaleString()} />
+                <StatCard label="% Positive CLV"
                   value={`${(data.clv.summary.pct_positive_clv * 100).toFixed(0)}%`}
-                  sub="above 50% = skill"
-                />
-                <StatCard
-                  label="Mean CLV (log-odds)"
+                  sub="above 50% = skill" accent />
+                <StatCard label="Mean CLV (log-odds)"
                   value={data.clv.summary.mean_clv_log_odds.toFixed(3)}
-                  sub=">0 = buying below close"
-                />
-                <StatCard
-                  label="t-stat / p-value"
+                  sub=">0 = buying below close" />
+                <StatCard label="t-stat / p-value"
                   value={`${data.clv.summary.clv_tstat.toFixed(2)} / ${data.clv.summary.clv_pvalue.toFixed(3)}`}
-                  sub="H0: CLV = 0"
-                />
-                <StatCard
-                  label="Result correlation"
+                  sub="H₀: CLV = 0" />
+                <StatCard label="Result correlation"
                   value={data.clv.summary.clv_result_corr.toFixed(3)}
-                  sub="CLV predicts outcome"
-                />
-                <StatCard
-                  label="ROI %"
+                  sub="CLV predicts outcome" />
+                <StatCard label="ROI"
                   value={`${data.clv.summary.roi_pct.toFixed(2)}%`}
-                />
-                <StatCard
-                  label="Total P&L (units)"
-                  value={data.clv.summary.total_pnl_units.toFixed(2)}
-                />
+                  accent={data.clv.summary.roi_pct > 0} />
+                <StatCard label="Total P&L (units)"
+                  value={data.clv.summary.total_pnl_units.toFixed(2)} />
               </div>
-            </section>
+            </Card>
           )}
 
-          {/* no data at all */}
+          {/* nothing at all */}
           {!data.walk_forward.available && !data.calibration.available && !data.clv.available && (
-            <p className="text-sm text-muted py-6 text-center">
-              No backtest data found. Run the pipeline first:
-              <code className="ml-1 bg-gray-100 px-1.5 py-0.5 rounded font-mono text-xs">
+            <div style={{ textAlign: 'center', padding: '48px 0', color: C.muted, fontSize: 13 }}>
+              No backtest data found. Run the pipeline first:&nbsp;
+              <code style={{
+                background: C.card, border: `1px solid ${C.border}`,
+                borderRadius: 5, padding: '2px 8px', fontFamily: 'monospace',
+                fontSize: 12, color: C.accent,
+              }}>
                 .venv/bin/python main.py --backtest
               </code>
-            </p>
+            </div>
           )}
+
         </div>
       )}
     </div>
