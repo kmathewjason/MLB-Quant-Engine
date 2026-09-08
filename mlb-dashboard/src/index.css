@@ -1,4 +1,24 @@
-*, *::before, *::after { box-sizing: border-box; }
-body { margin: 0; padding: 0; }
-button { font-family: inherit; }
-input, select { font-family: inherit; }
+@import "tailwindcss";
+
+@theme {
+  --color-brand:     #2563eb;
+  --color-brand-50:  #eff6ff;
+  --color-brand-100: #dbeafe;
+  --color-muted:     #6b7280;
+  --color-surface:   #f8fafc;
+  --color-border:    #e5e7eb;
+  --color-pos:       #16a34a;
+  --color-neg:       #dc2626;
+  --color-pos-bg:    #dcfce7;
+  --color-neg-bg:    #fee2e2;
+}
+
+body {
+  @apply bg-surface text-gray-900 antialiased;
+  font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+}
+
+/* scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { @apply bg-gray-300 rounded-full; }

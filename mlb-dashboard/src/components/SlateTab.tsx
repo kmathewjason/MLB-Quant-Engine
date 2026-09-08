@@ -1,177 +1,282 @@
-import { useState, useEffect } from 'react';
-import { fetchDailyPredictions } from '../api';
-import type { DailyGame, MarketRow } from '../types';
-import { ErrorBanner, Spinner, Badge, Pct, Card, Table } from './ui';
+/**
+ * SlateTab — daily slate with sortable/filterable market table.
+ *
+ * Filters  : market type (h2h / total / spread), min edge %, min EV %
+ * Sort     : click any column header; second click reverses
+ * Game detail: click a row → GameDetailModal opens for that game_pk
+ */
+import { useState, useEffect, useMemo } from 'react'
+import { fetchDailyPredictions } from '../api'
+import type { DailyGame, MarketRow } from '../types'
+import GameDetailModal from './GameDetailModal'
 
-function WinBar({ home, away, homeTeam, awayTeam }: {
-  home: number; away: number; homeTeam: string; awayTeam: string;
+// ── helpers ────────────────────────────────────────────────────────────────
+
+function pct(v: number | null, decimals = 1) {
+  if (v === null) return <span className="text-gray-300">—</span>
+  return <span>{(v * 100).toFixed(decimals)}%</span>
+}
+
+function signed(v: number | null) {
+  if (v === null) return <span className="text-gray-300">—</span>
+  const cls = v >= 0 ? 'text-pos bg-pos-bg' : 'text-neg bg-neg-bg'
+  return (
+    <span className={`inline-block px-1.5 py-0.5 rounded text-xs font-semibold ${cls}`}>
+      {v >= 0 ? '+' : ''}{(v * 100).toFixed(1)}%
+    </span>
+  )
+}
+
+function odds(v: number | null) {
+  if (v === null) return <span className="text-gray-300">—</span>
+  return <span>{v > 0 ? `+${v}` : v}</span>
+}
+
+type SortKey = keyof MarketRow | 'game'
+type SortDir = 'asc' | 'desc'
+
+interface FlatRow extends MarketRow {
+  game_pk: number
+  matchup: string
+  game_date: string
+}
+
+const MARKET_TYPE_OPTIONS = [
+  { value: '',       label: 'All markets' },
+  { value: 'h2h',    label: 'Moneyline (h2h)' },
+  { value: 'total',  label: 'Totals' },
+  { value: 'spread', label: 'Spread' },
+]
+
+// ── sub-components ─────────────────────────────────────────────────────────
+
+function SortHeader({
+  label, col, sortCol, sortDir, onSort,
+}: {
+  label: string; col: SortKey; sortCol: SortKey; sortDir: SortDir
+  onSort: (k: SortKey) => void
 }) {
+  const active = sortCol === col
   return (
-    <div style={{ marginBottom: 8 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 2 }}>
-        <span style={{ color: '#374151', fontWeight: 600 }}>{homeTeam}</span>
-        <span style={{ color: '#6b7280' }}>{awayTeam}</span>
-      </div>
-      <div style={{ display: 'flex', height: 18, borderRadius: 3, overflow: 'hidden' }}>
-        <div style={{
-          width: `${home * 100}%`, background: '#3b82d4',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          fontSize: 11, color: '#fff', fontWeight: 600,
-        }}>
-          {(home * 100).toFixed(0)}%
-        </div>
-        <div style={{
-          flex: 1, background: '#e5e7eb',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          fontSize: 11, color: '#374151', fontWeight: 600,
-        }}>
-          {(away * 100).toFixed(0)}%
-        </div>
-      </div>
-    </div>
-  );
+    <th
+      className="px-3 py-2 text-left text-xs font-semibold text-muted uppercase tracking-wide cursor-pointer select-none whitespace-nowrap hover:text-gray-700"
+      onClick={() => onSort(col)}
+    >
+      {label}
+      {active && <span className="ml-1 opacity-60">{sortDir === 'asc' ? '↑' : '↓'}</span>}
+    </th>
+  )
 }
 
-function RunBoxes({ label, dist }: { label: string; dist: { mean: number; p10: number; p50: number; p90: number } }) {
-  return (
-    <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 4 }}>
-      <span style={{ fontSize: 12, color: '#6b7280', width: 80, flexShrink: 0 }}>{label}</span>
-      <span style={{ fontSize: 12, color: '#374151' }}>
-        μ <strong>{dist.mean.toFixed(1)}</strong>  ·
-        p10-p90: {dist.p10.toFixed(0)}–{dist.p90.toFixed(0)}  ·
-        median: {dist.p50.toFixed(0)}
-      </span>
-    </div>
-  );
-}
+// ── main component ─────────────────────────────────────────────────────────
 
-function MarketsTable({ markets }: { markets: MarketRow[] }) {
-  if (markets.length === 0) return <p style={{ color: '#9ca3af', fontSize: 12 }}>No markets available</p>;
-  return (
-    <Table
-      headers={['Market', 'Model %', 'Market %', 'Edge', 'EV', '¼K Stake']}
-      rows={markets.map(m => [
-        m.label,
-        <Pct v={m.model_prob} />,
-        m.market_prob != null ? <Pct v={m.market_prob} /> : <span style={{ color: '#9ca3af' }}>—</span>,
-        m.edge != null ? <Badge value={m.edge} /> : <span style={{ color: '#9ca3af' }}>—</span>,
-        m.ev != null ? <Badge value={m.ev} /> : <span style={{ color: '#9ca3af' }}>—</span>,
-        m.stake_units != null ? `$${m.stake_units.toFixed(0)}` : <span style={{ color: '#9ca3af' }}>—</span>,
-      ])}
-    />
-  );
-}
+export default function SlateTab() {
+  const [games,    setGames]    = useState<DailyGame[]>([])
+  const [loading,  setLoading]  = useState(false)
+  const [error,    setError]    = useState<string | null>(null)
+  const [date,     setDate]     = useState('')
+  const [detail,   setDetail]   = useState<{ game: DailyGame; totalLine: number } | null>(null)
 
-function GameCard({ game }: { game: DailyGame }) {
-  const [expanded, setExpanded] = useState(false);
-  const sim = game.simulation;
+  // filters
+  const [mktType,  setMktType]  = useState('')
+  const [minEdge,  setMinEdge]  = useState('')
+  const [minEV,    setMinEV]    = useState('')
+  const [minStake, setMinStake] = useState('')
 
-  return (
-    <Card>
-      {/* Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-        <div>
-          <span style={{ fontWeight: 700, fontSize: 15, color: '#111827' }}>
-            {game.away_team} @ {game.home_team}
-          </span>
-          <span style={{ marginLeft: 10, fontSize: 12, color: '#9ca3af' }}>{game.status}</span>
-        </div>
-        <button
-          onClick={() => setExpanded(e => !e)}
-          style={{
-            border: '1px solid #e5e7eb', borderRadius: 5, background: '#f9fafb',
-            padding: '3px 10px', cursor: 'pointer', fontSize: 12, color: '#374151',
-          }}
-        >
-          {expanded ? 'Less' : 'Details'}
-        </button>
-      </div>
-
-      <div style={{ fontSize: 11, color: '#9ca3af', marginBottom: 8 }}>
-        SP: {game.away_probable_pitcher} vs {game.home_probable_pitcher}
-      </div>
-
-      {/* Win probability bar */}
-      <WinBar
-        home={sim.home_win_prob}
-        away={sim.away_win_prob}
-        homeTeam={game.home_team}
-        awayTeam={game.away_team}
-      />
-
-      {/* Run distributions */}
-      <div style={{ marginTop: 10 }}>
-        <RunBoxes label="Home runs" dist={sim.home_runs} />
-        <RunBoxes label="Away runs" dist={sim.away_runs} />
-        <RunBoxes label="Total"     dist={sim.total_runs} />
-      </div>
-
-      {/* Totals quick view */}
-      {Object.keys(sim.totals).length > 0 && (
-        <div style={{ marginTop: 8, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-          {Object.entries(sim.totals).map(([k, v]) => (
-            <span key={k} style={{ fontSize: 12, background: '#eff6ff', padding: '2px 8px', borderRadius: 4, color: '#1d4ed8' }}>
-              O{k.split('_')[1].replace(/_/g, '.')}: <strong>{(v * 100).toFixed(0)}%</strong>
-            </span>
-          ))}
-        </div>
-      )}
-
-      {/* Markets (collapsed by default) */}
-      {expanded && (
-        <div style={{ marginTop: 14 }}>
-          <div style={{ fontSize: 12, fontWeight: 600, color: '#374151', marginBottom: 6 }}>Markets</div>
-          <MarketsTable markets={game.markets} />
-        </div>
-      )}
-
-      <div style={{ fontSize: 11, color: '#d1d5db', marginTop: 8 }}>
-        {sim.n_sims.toLocaleString()} simulations · pk {game.game_pk}
-      </div>
-    </Card>
-  );
-}
-
-export function SlateTab() {
-  const [games, setGames] = useState<DailyGame[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [date, setDate] = useState('');
+  // sort
+  const [sortCol,  setSortCol]  = useState<SortKey>('ev')
+  const [sortDir,  setSortDir]  = useState<SortDir>('desc')
 
   const load = () => {
-    setLoading(true);
-    setError(null);
+    setLoading(true); setError(null)
     fetchDailyPredictions(date || undefined, 10_000)
       .then(env => setGames(env.data))
       .catch(e => setError(String(e)))
-      .finally(() => setLoading(false));
-  };
+      .finally(() => setLoading(false))
+  }
 
-  useEffect(() => { load(); }, []);  // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { load() }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // flatten games × markets into rows
+  const flat: FlatRow[] = useMemo(() => {
+    const rows: FlatRow[] = []
+    for (const g of games) {
+      for (const m of g.markets) {
+        rows.push({
+          ...m,
+          game_pk:   g.game_pk,
+          matchup:   `${g.away_team} @ ${g.home_team}`,
+          game_date: g.game_date,
+        })
+      }
+    }
+    return rows
+  }, [games])
+
+  // filter
+  const filtered = useMemo(() => {
+    const edgeMin  = parseFloat(minEdge)  / 100
+    const evMin    = parseFloat(minEV)    / 100
+    const stakeMin = parseFloat(minStake)
+    return flat.filter(r => {
+      if (mktType && !r.market.startsWith(mktType)) return false
+      if (!isNaN(edgeMin)  && (r.edge  ?? -Infinity) < edgeMin)  return false
+      if (!isNaN(evMin)    && (r.ev    ?? -Infinity) < evMin)    return false
+      if (!isNaN(stakeMin) && (r.stake_units ?? -Infinity) < stakeMin) return false
+      return true
+    })
+  }, [flat, mktType, minEdge, minEV, minStake])
+
+  // sort
+  const sorted = useMemo(() => {
+    return [...filtered].sort((a, b) => {
+      let av: number | string | null = null
+      let bv: number | string | null = null
+      if (sortCol === 'game') { av = a.matchup; bv = b.matchup }
+      else { av = a[sortCol] as number | null; bv = b[sortCol] as number | null }
+      if (av === null || av === undefined) return 1
+      if (bv === null || bv === undefined) return -1
+      const cmp = av < bv ? -1 : av > bv ? 1 : 0
+      return sortDir === 'asc' ? cmp : -cmp
+    })
+  }, [filtered, sortCol, sortDir])
+
+  const toggleSort = (col: SortKey) => {
+    if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+    else { setSortCol(col); setSortDir('desc') }
+  }
+
+  // open detail modal: find the game and derive total line from market keys
+  const openDetail = (row: FlatRow) => {
+    const game = games.find(g => g.game_pk === row.game_pk)
+    if (!game) return
+    const totalKey = Object.keys(game.simulation.totals)[0] ?? ''
+    const lineNum = parseFloat(totalKey.replace(/[^0-9.]/g, '')) || 8.5
+    setDetail({ game, totalLine: lineNum })
+  }
 
   return (
     <div>
-      <div style={{ display: 'flex', gap: 8, marginBottom: 16, alignItems: 'center' }}>
-        <input
-          type="date"
-          value={date}
-          onChange={e => setDate(e.target.value)}
-          style={{ border: '1px solid #d1d5db', borderRadius: 5, padding: '5px 9px', fontSize: 13 }}
-        />
-        <button onClick={load} style={{
-          background: '#3b82d4', color: '#fff', border: 'none', borderRadius: 5,
-          padding: '6px 14px', cursor: 'pointer', fontSize: 13, fontWeight: 600,
-        }}>
-          Refresh
+      {/* ── Controls ────────────────────────────────────────────────── */}
+      <div className="flex flex-wrap gap-2 mb-4 items-end">
+        <label className="flex flex-col gap-0.5 text-xs text-muted">
+          Date
+          <input
+            type="date" value={date} onChange={e => setDate(e.target.value)}
+            className="border border-border rounded px-2 py-1.5 text-sm text-gray-800 bg-white focus:outline-none focus:ring-1 focus:ring-brand"
+          />
+        </label>
+
+        <label className="flex flex-col gap-0.5 text-xs text-muted">
+          Market type
+          <select
+            value={mktType} onChange={e => setMktType(e.target.value)}
+            className="border border-border rounded px-2 py-1.5 text-sm text-gray-800 bg-white focus:outline-none focus:ring-1 focus:ring-brand"
+          >
+            {MARKET_TYPE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+        </label>
+
+        {[
+          { label: 'Min edge %', value: minEdge, set: setMinEdge, ph: 'e.g. 2' },
+          { label: 'Min EV %',   value: minEV,   set: setMinEV,   ph: 'e.g. 1' },
+          { label: 'Min stake $', value: minStake, set: setMinStake, ph: 'e.g. 10' },
+        ].map(f => (
+          <label key={f.label} className="flex flex-col gap-0.5 text-xs text-muted">
+            {f.label}
+            <input
+              type="number" value={f.value} onChange={e => f.set(e.target.value)}
+              placeholder={f.ph}
+              className="border border-border rounded px-2 py-1.5 text-sm text-gray-800 bg-white w-24 focus:outline-none focus:ring-1 focus:ring-brand"
+            />
+          </label>
+        ))}
+
+        <button
+          onClick={load}
+          className="self-end bg-brand text-white text-sm font-semibold px-4 py-1.5 rounded hover:bg-blue-700 active:scale-95 transition-all"
+        >
+          {loading ? 'Loading…' : 'Refresh'}
         </button>
-        {loading && <span style={{ fontSize: 12, color: '#9ca3af' }}>Loading…</span>}
       </div>
 
-      {error && <ErrorBanner message={error} />}
-      {!loading && games.length === 0 && !error && (
-        <p style={{ color: '#9ca3af', fontSize: 13 }}>No games found for this date.</p>
+      {/* ── Error ───────────────────────────────────────────────────── */}
+      {error && (
+        <div className="mb-3 bg-red-50 border border-red-200 text-red-700 text-sm px-3 py-2 rounded">
+          ⚠ {error}
+        </div>
       )}
-      {loading ? <Spinner /> : games.map(g => <GameCard key={g.game_pk} game={g} />)}
+
+      {/* ── Summary bar ─────────────────────────────────────────────── */}
+      {!loading && sorted.length > 0 && (
+        <p className="text-xs text-muted mb-2">
+          {sorted.length} market{sorted.length !== 1 ? 's' : ''} across {games.length} game{games.length !== 1 ? 's' : ''}
+          {(minEdge || minEV || mktType || minStake) ? ' (filtered)' : ''}
+        </p>
+      )}
+
+      {/* ── Table ───────────────────────────────────────────────────── */}
+      <div className="rounded-lg border border-border bg-white overflow-x-auto shadow-sm">
+        <table className="w-full text-sm border-collapse">
+          <thead className="bg-gray-50 border-b border-border">
+            <tr>
+              <SortHeader label="Game"         col="game"         sortCol={sortCol} sortDir={sortDir} onSort={toggleSort} />
+              <SortHeader label="Market"       col="label"        sortCol={sortCol} sortDir={sortDir} onSort={toggleSort} />
+              <SortHeader label="Model %"      col="model_prob"   sortCol={sortCol} sortDir={sortDir} onSort={toggleSort} />
+              <SortHeader label="Market %"     col="market_prob"  sortCol={sortCol} sortDir={sortDir} onSort={toggleSort} />
+              <SortHeader label="Odds"         col="market_odds"  sortCol={sortCol} sortDir={sortDir} onSort={toggleSort} />
+              <SortHeader label="Edge"         col="edge"         sortCol={sortCol} sortDir={sortDir} onSort={toggleSort} />
+              <SortHeader label="EV"           col="ev"           sortCol={sortCol} sortDir={sortDir} onSort={toggleSort} />
+              <SortHeader label="Full Kelly"   col="kelly_full"   sortCol={sortCol} sortDir={sortDir} onSort={toggleSort} />
+              <SortHeader label="¼K Stake"     col="stake_units"  sortCol={sortCol} sortDir={sortDir} onSort={toggleSort} />
+            </tr>
+          </thead>
+          <tbody>
+            {loading && (
+              <tr><td colSpan={9} className="text-center py-10 text-muted text-sm">Loading…</td></tr>
+            )}
+            {!loading && sorted.length === 0 && (
+              <tr><td colSpan={9} className="text-center py-10 text-muted text-sm">
+                {games.length === 0 ? 'No games — click Refresh.' : 'No markets match the current filters.'}
+              </td></tr>
+            )}
+            {sorted.map((r, i) => (
+              <tr
+                key={`${r.game_pk}-${r.market}`}
+                className={[
+                  'border-b border-gray-50 cursor-pointer',
+                  i % 2 === 0 ? 'bg-white' : 'bg-gray-50/50',
+                  'hover:bg-brand-50 transition-colors',
+                ].join(' ')}
+                onClick={() => openDetail(r)}
+              >
+                <td className="px-3 py-2 font-medium text-gray-800 whitespace-nowrap">{r.matchup}</td>
+                <td className="px-3 py-2 text-muted whitespace-nowrap">{r.label}</td>
+                <td className="px-3 py-2 tabular-nums">{pct(r.model_prob)}</td>
+                <td className="px-3 py-2 tabular-nums">{pct(r.market_prob)}</td>
+                <td className="px-3 py-2 tabular-nums">{odds(r.market_odds)}</td>
+                <td className="px-3 py-2 tabular-nums">{signed(r.edge)}</td>
+                <td className="px-3 py-2 tabular-nums">{signed(r.ev)}</td>
+                <td className="px-3 py-2 tabular-nums">{pct(r.kelly_full, 2)}</td>
+                <td className="px-3 py-2 tabular-nums font-semibold">
+                  {r.stake_units !== null
+                    ? <span className="text-brand">${r.stake_units.toFixed(0)}</span>
+                    : <span className="text-gray-300">—</span>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {/* ── Game detail modal ────────────────────────────────────────── */}
+      {detail && (
+        <GameDetailModal
+          game={detail.game}
+          defaultTotalLine={detail.totalLine}
+          onClose={() => setDetail(null)}
+        />
+      )}
     </div>
-  );
+  )
 }

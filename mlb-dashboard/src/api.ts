@@ -1,8 +1,8 @@
 /**
- * Thin fetch helpers for the MLB Quant Engine API.
- * All requests are relative — Vite proxies them to the FastAPI backend.
+ * Axios API client for the MLB Quant Engine backend.
+ * All URLs are relative — Vite's dev proxy forwards /api/* to FastAPI.
  */
-
+import axios from 'axios'
 import type {
   Envelope,
   DailyGame,
@@ -10,48 +10,56 @@ import type {
   SGPLeg,
   SGPData,
   BacktestData,
-} from './types';
+} from './types'
 
-async function get<T>(path: string): Promise<T> {
-  const res = await fetch(path);
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`${res.status} ${res.statusText}: ${body}`);
+const client = axios.create({ baseURL: '/' })
+
+// ── helpers ────────────────────────────────────────────────────────────────
+
+function apiError(err: unknown): never {
+  if (axios.isAxiosError(err)) {
+    const detail = (err.response?.data as { detail?: string })?.detail
+    throw new Error(detail ?? err.message)
   }
-  return res.json() as Promise<T>;
+  throw err
 }
 
-async function post<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const b = await res.text().catch(() => '');
-    throw new Error(`${res.status} ${res.statusText}: ${b}`);
-  }
-  return res.json() as Promise<T>;
-}
+// ── endpoints ──────────────────────────────────────────────────────────────
 
 export async function fetchDailyPredictions(
   date?: string,
   nSims = 20_000,
 ): Promise<Envelope<DailyGame[]>> {
-  const params = new URLSearchParams({ n_sims: String(nSims) });
-  if (date) params.set('date', date);
-  return get<Envelope<DailyGame[]>>(`/api/predictions/daily?${params}`);
+  try {
+    const { data } = await client.get<Envelope<DailyGame[]>>('/api/predictions/daily', {
+      params: { n_sims: nSims, ...(date ? { date } : {}) },
+    })
+    return data
+  } catch (e) {
+    return apiError(e)
+  }
 }
 
 export async function fetchGameSimulation(
   gameId: number,
   opts: { nSims?: number; totalLine?: number; runLine?: number; bins?: number } = {},
 ): Promise<Envelope<GameSimData>> {
-  const params = new URLSearchParams({ n_sims: String(opts.nSims ?? 50_000) });
-  if (opts.totalLine !== undefined) params.set('total_line', String(opts.totalLine));
-  if (opts.runLine !== undefined) params.set('run_line', String(opts.runLine));
-  if (opts.bins !== undefined) params.set('bins', String(opts.bins));
-  return get<Envelope<GameSimData>>(`/api/games/${gameId}/simulation?${params}`);
+  try {
+    const { data } = await client.get<Envelope<GameSimData>>(
+      `/api/games/${gameId}/simulation`,
+      {
+        params: {
+          n_sims: opts.nSims ?? 50_000,
+          ...(opts.totalLine !== undefined ? { total_line: opts.totalLine } : {}),
+          ...(opts.runLine  !== undefined ? { run_line:   opts.runLine  } : {}),
+          ...(opts.bins     !== undefined ? { bins:       opts.bins     } : {}),
+        },
+      },
+    )
+    return data
+  } catch (e) {
+    return apiError(e)
+  }
 }
 
 export async function fetchSGP(
@@ -60,14 +68,24 @@ export async function fetchSGP(
   bankroll = 1000,
   nSims = 20_000,
 ): Promise<Envelope<SGPData>> {
-  return post<Envelope<SGPData>>('/api/predictions/sgp', {
-    game_id: gameId,
-    legs,
-    bankroll,
-    n_sims: nSims,
-  });
+  try {
+    const { data } = await client.post<Envelope<SGPData>>('/api/predictions/sgp', {
+      game_id: gameId,
+      legs,
+      bankroll,
+      n_sims: nSims,
+    })
+    return data
+  } catch (e) {
+    return apiError(e)
+  }
 }
 
 export async function fetchBacktestReport(): Promise<Envelope<BacktestData>> {
-  return get<Envelope<BacktestData>>('/api/backtest/report');
+  try {
+    const { data } = await client.get<Envelope<BacktestData>>('/api/backtest/report')
+    return data
+  } catch (e) {
+    return apiError(e)
+  }
 }

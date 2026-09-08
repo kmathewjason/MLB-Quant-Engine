@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/api.ts","./src/main.tsx","./src/types.ts","./src/components/backtesttab.tsx","./src/components/sgptab.tsx","./src/components/simtab.tsx","./src/components/slatetab.tsx","./src/components/tabbar.tsx","./src/components/ui.tsx"],"version":"5.9.3"}
+{"root":["./src/app.tsx","./src/api.ts","./src/main.tsx","./src/types.ts","./src/vite-env.d.ts","./src/components/backtesttab.tsx","./src/components/gamedetailmodal.tsx","./src/components/sgptab.tsx","./src/components/slatetab.tsx","./src/components/tabbar.tsx"],"version":"5.9.3"}
