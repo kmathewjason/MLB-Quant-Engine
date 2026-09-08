@@ -145,6 +145,10 @@ def get_schedule(
     return games
 
 
+#: Alias kept for API import compatibility and test mocking.
+fetch_schedule = get_schedule
+
+
 # ---------------------------------------------------------------------------
 # Boxscore
 # ---------------------------------------------------------------------------
