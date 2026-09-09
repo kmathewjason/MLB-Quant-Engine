@@ -46,3 +46,6 @@ htmlcov/
 mlb-dashboard/node_modules/
 mlb-dashboard/dist/
 mlb-dashboard/.env
+
+# Dev server runtime artefacts (pid file, log output)
+logs/
