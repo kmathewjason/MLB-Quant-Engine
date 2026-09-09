@@ -575,3 +575,330 @@ class TestBacktestReport:
         meta = client.get("/api/backtest/report").json()["meta"]
         assert "generated_at" in meta
         assert "version" in meta
+
+
+# ===========================================================================
+# GET /api/games/{game_id}/legs
+# ===========================================================================
+
+# Minimal raw MLB Stats API schedule structure used by the board + legs endpoints
+_FAKE_SCHED_RAW = {
+    "dates": [{
+        "games": [{
+            "gamePk": 999_001,
+            "officialDate": "2024-04-15",
+            "gameDate": "2024-04-15T18:05:00Z",
+            "status": {"detailedState": "Preview"},
+            "teams": {
+                "home": {
+                    "team": {"name": "New York Yankees"},
+                    "probablePitcher": {"fullName": "Gerrit Cole"},
+                },
+                "away": {
+                    "team": {"name": "Boston Red Sox"},
+                    "probablePitcher": {"fullName": "Chris Sale"},
+                },
+            },
+            "venue": {"name": "Yankee Stadium"},
+            "seriesDescription": "Regular Season",
+        }]
+    }]
+}
+
+
+def _patch_load_or_fetch(mocker, raw=None):
+    return mocker.patch(
+        "src.ingestion.mlb_stats_api._load_or_fetch",
+        return_value=raw or _FAKE_SCHED_RAW,
+    )
+
+
+def _patch_pa_probs(mocker):
+    import numpy as np
+    pa = np.tile(
+        np.array([0.15, 0.05, 0.01, 0.03, 0.09, 0.20, 0.47]),
+        (9, 1),
+    )
+    return mocker.patch(
+        "src.ingestion.player_stats.get_game_pa_probs",
+        return_value=(pa, pa),
+    )
+
+
+class TestGameLegs:
+
+    def test_returns_envelope(self, mocker):
+        _patch_load_or_fetch(mocker)
+        _patch_pa_probs(mocker)
+        resp = client.get("/api/games/999001/legs?n_sims=500")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "data" in body
+        assert "meta" in body
+
+    def test_data_shape(self, mocker):
+        _patch_load_or_fetch(mocker)
+        _patch_pa_probs(mocker)
+        data = client.get("/api/games/999001/legs?n_sims=500").json()["data"]
+        assert data["game_id"] == 999_001
+        assert isinstance(data["home_team"], str)
+        assert isinstance(data["away_team"], str)
+        assert isinstance(data["legs"], list)
+        assert isinstance(data["cache_ready"], bool)
+
+    def test_legs_have_required_fields(self, mocker):
+        _patch_load_or_fetch(mocker)
+        _patch_pa_probs(mocker)
+        legs = client.get("/api/games/999001/legs?n_sims=500").json()["data"]["legs"]
+        assert len(legs) > 0
+        for leg in legs:
+            for field in ("leg_id", "description", "market_type", "side", "model_prob"):
+                assert field in leg, f"Missing field: {field}"
+            assert isinstance(leg["leg_id"], str)
+            assert 0.0 <= leg["model_prob"] <= 1.0
+
+    def test_leg_ids_stable_format(self, mocker):
+        """leg_id must start with the game_id prefix."""
+        _patch_load_or_fetch(mocker)
+        _patch_pa_probs(mocker)
+        legs = client.get("/api/games/999001/legs?n_sims=500").json()["data"]["legs"]
+        for leg in legs:
+            assert leg["leg_id"].startswith("999001:"), (
+                f"leg_id {leg['leg_id']!r} missing game prefix"
+            )
+
+
+# ===========================================================================
+# POST /api/parlays/evaluate
+# ===========================================================================
+
+def _make_eval_body(game_id: int = 999_001) -> dict:
+    return {
+        "legs": [
+            {
+                "leg_id":      f"{game_id}:moneyline_home",
+                "game_id":     game_id,
+                "description": "NYY ML",
+                "side":        "home",
+                "market_type": "moneyline",
+                "model_prob":  0.55,
+                "market_odds": -130,
+                "line":        None,
+            },
+            {
+                "leg_id":      f"{game_id}:total_over_8.5",
+                "game_id":     game_id,
+                "description": "O 8.5",
+                "side":        "over",
+                "market_type": "total",
+                "model_prob":  0.52,
+                "market_odds": -110,
+                "line":        8.5,
+            },
+        ],
+        "bankroll": 1000.0,
+        "n_sims":   1_000,
+    }
+
+
+class TestParlayEvaluate:
+
+    def test_returns_200_envelope(self):
+        resp = client.post("/api/parlays/evaluate", json=_make_eval_body())
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "data" in body
+        assert "meta" in body
+
+    def test_data_keys_present(self):
+        data = client.post("/api/parlays/evaluate", json=_make_eval_body()).json()["data"]
+        for k in ("legs", "groups", "joint_prob_corr_adjusted",
+                  "joint_prob_naive", "parlay_net_payout",
+                  "pct_diff_corr_vs_naive", "kelly", "n_sims"):
+            assert k in data, f"Missing key: {k}"
+
+    def test_joint_probs_in_range(self):
+        data = client.post("/api/parlays/evaluate", json=_make_eval_body()).json()["data"]
+        assert 0 < data["joint_prob_corr_adjusted"] < 1
+        assert 0 < data["joint_prob_naive"] < 1
+
+    def test_naive_approx_product_of_probs(self):
+        """Naive joint is in (0,1) and below the minimum marginal prob.
+
+        For same-game legs the naive prob is the product of the *simulated*
+        marginal probs (not the input model_prob), so we only assert it is
+        strictly less than the smaller of the two marginals and greater than 0.
+        """
+        data = client.post("/api/parlays/evaluate", json=_make_eval_body()).json()["data"]
+        marginals = [l["marginal_prob"] for l in data["legs"]]
+        assert 0 < data["joint_prob_naive"] < min(marginals)
+
+    def test_kelly_structure(self):
+        kelly = client.post("/api/parlays/evaluate", json=_make_eval_body()).json()["data"]["kelly"]
+        for variant in ("corr_adjusted", "naive"):
+            for field in ("ev", "f_star", "f_quarter", "stake_units"):
+                assert field in kelly[variant]
+
+    def test_parlay_net_payout_positive(self):
+        data = client.post("/api/parlays/evaluate", json=_make_eval_body()).json()["data"]
+        assert data["parlay_net_payout"] > 0
+
+    def test_cross_game_legs_treated_independently(self):
+        """Two legs from different game_ids → each in its own group."""
+        body = {
+            "legs": [
+                {
+                    "leg_id": "111:moneyline_home", "game_id": 111,
+                    "description": "Team A ML", "side": "home",
+                    "market_type": "moneyline", "model_prob": 0.55,
+                    "market_odds": -130, "line": None,
+                },
+                {
+                    "leg_id": "222:moneyline_home", "game_id": 222,
+                    "description": "Team B ML", "side": "home",
+                    "market_type": "moneyline", "model_prob": 0.52,
+                    "market_odds": -110, "line": None,
+                },
+            ],
+            "bankroll": 1000.0,
+            "n_sims": 1_000,
+        }
+        data = client.post("/api/parlays/evaluate", json=body).json()["data"]
+        # Two separate groups
+        assert len(data["groups"]) == 2
+        # Joint prob must equal product of independent probs (exactly, since no MC run)
+        assert math.isclose(
+            data["joint_prob_corr_adjusted"],
+            0.55 * 0.52,
+            rel_tol=0.01,
+        ), f"Expected ~{0.55*0.52:.4f}, got {data['joint_prob_corr_adjusted']}"
+
+    def test_requires_min_2_legs(self):
+        body = {
+            "legs": [{
+                "leg_id": "999:ml_home", "game_id": 999,
+                "description": "X", "side": "home",
+                "market_type": "moneyline", "model_prob": 0.55,
+                "market_odds": -110, "line": None,
+            }],
+            "bankroll": 1000.0,
+            "n_sims": 1_000,
+        }
+        resp = client.post("/api/parlays/evaluate", json=body)
+        assert resp.status_code == 422
+
+
+# ===========================================================================
+# GET /api/parlays/suggested
+# ===========================================================================
+
+class TestParlaysSuggested:
+
+    def _patch_board(self, mocker, rows: list[dict] | None = None):
+        """Mock the inner api_game_board call used by suggested."""
+        if rows is None:
+            rows = [
+                {
+                    "category": "moneyline", "label": "NYY ML",
+                    "side": "home", "line": None,
+                    "model_prob": 0.56, "market_prob": 0.50,
+                    "market_odds": -130, "edge": 0.06,
+                    "ev_per_dollar": 0.03, "kelly_stake": 10.0,
+                    "confidence": {"point_estimate": 0.56, "ci_low": 0.52,
+                                   "ci_high": 0.60, "ci_width": 0.08},
+                    "confidence_score": 0.75,
+                },
+                {
+                    "category": "total", "label": "O 8.5",
+                    "side": "over", "line": 8.5,
+                    "model_prob": 0.53, "market_prob": 0.50,
+                    "market_odds": -110, "edge": 0.03,
+                    "ev_per_dollar": 0.015, "kelly_stake": 5.0,
+                    "confidence": {"point_estimate": 0.53, "ci_low": 0.49,
+                                   "ci_high": 0.57, "ci_width": 0.08},
+                    "confidence_score": 0.40,
+                },
+            ]
+        import src.api as _api
+
+        async def _fake_board(**kw):
+            return {
+                "data": {
+                    "game_id": kw.get("game_id", 999_001),
+                    "home_team": "NYY",
+                    "away_team": "BOS",
+                    "n_sims": 1000,
+                    "rows": rows,
+                    "omitted": [],
+                }
+            }
+
+        mocker.patch.object(_api, "api_game_board", new=_fake_board)
+
+    def test_invalid_mode_422(self, mocker):
+        _patch_load_or_fetch(mocker)
+        resp = client.get("/api/parlays/suggested?mode=garbage")
+        assert resp.status_code == 422
+
+    def test_no_games_returns_empty(self, mocker):
+        mocker.patch(
+            "src.ingestion.mlb_stats_api._load_or_fetch",
+            return_value={"dates": []},
+        )
+        data = client.get("/api/parlays/suggested?mode=sgp&n_sims=1000").json()["data"]
+        assert data["parlays"] == []
+        assert data["message"] is not None
+
+    def test_sgp_envelope(self, mocker):
+        _patch_load_or_fetch(mocker)
+        self._patch_board(mocker)
+        resp = client.get("/api/parlays/suggested?mode=sgp&n_sims=1000")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "data" in body and "meta" in body
+
+    def test_sgp_data_shape(self, mocker):
+        _patch_load_or_fetch(mocker)
+        self._patch_board(mocker)
+        data = client.get("/api/parlays/suggested?mode=sgp&n_sims=1000").json()["data"]
+        assert data["mode"] == "sgp"
+        assert isinstance(data["parlays"], list)
+        assert isinstance(data["skipped_games"], list)
+
+    def test_sgp_parlay_fields(self, mocker):
+        _patch_load_or_fetch(mocker)
+        self._patch_board(mocker)
+        parlays = client.get("/api/parlays/suggested?mode=sgp&n_sims=1000").json()["data"]["parlays"]
+        assert len(parlays) > 0
+        p = parlays[0]
+        for field in ("rank", "legs", "game_ids", "joint_prob_corr",
+                      "joint_prob_naive", "parlay_net_payout",
+                      "ev", "kelly_stake", "ci_low", "ci_high"):
+            assert field in p, f"Missing field: {field}"
+        assert p["rank"] == 1
+        assert len(p["legs"]) >= 2
+
+    def test_crossgame_mode(self, mocker):
+        # Stub two games in schedule for cross-game
+        sched_two = {
+            "dates": [{
+                "games": [
+                    {**_FAKE_SCHED_RAW["dates"][0]["games"][0]},
+                    {
+                        **_FAKE_SCHED_RAW["dates"][0]["games"][0],
+                        "gamePk": 999_002,
+                        "teams": {
+                            "home": {"team": {"name": "Cubs"}, "probablePitcher": {"fullName": "X"}},
+                            "away": {"team": {"name": "Cardinals"}, "probablePitcher": {"fullName": "Y"}},
+                        },
+                    },
+                ]
+            }]
+        }
+        mocker.patch("src.ingestion.mlb_stats_api._load_or_fetch", return_value=sched_two)
+        self._patch_board(mocker)
+        resp = client.get("/api/parlays/suggested?mode=crossgame&n_sims=1000")
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["mode"] == "crossgame"
+        assert isinstance(data["parlays"], list)

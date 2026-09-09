@@ -33,6 +33,25 @@ POST /api/predictions/sgp
      naive-independent vs correlation-adjusted comparison so the adjustment
      is visible.
 
+GET  /api/games/{game_id}/legs
+     Reshape the board rows into a selectable leg pick-list.  Every row
+     becomes a leg with a stable leg_id, description, market_type, side,
+     current_odds and model_probability.
+
+POST /api/parlays/evaluate
+     Body: { legs: [{leg_id, game_id, description, side, market_type,
+                     model_prob, market_odds}], bankroll }
+     Returns naive-independent and correlation-adjusted joint prob + Kelly
+     stake, plus the pct difference so the value of the correlation model
+     is visible.  SGP legs (same game_id) use the MC empirical covariance;
+     cross-game legs are treated as independent.
+
+GET  /api/parlays/suggested?bankroll=1000&mode=sgp|crossgame&date=YYYY-MM-DD
+     Optimizer-generated top-N parlay candidates.  SGP mode searches within
+     each game's leg set (2-4 legs, highest corr-adjusted EV).  Cross-game
+     mode combines today's highest-confidence independent picks across all
+     games (legs treated as independent).
+
 GET  /api/backtest/report
      Latest walk-forward backtest report as JSON for a dashboard backtest tab:
      calibration curve data (reliability diagram), Brier decomposition
@@ -1508,6 +1527,635 @@ async def api_game_board(
         "n_sims":    len(home_runs),
         "rows":      rows,
         "omitted":   omitted,
+    })
+
+
+# ===========================================================================
+# GET /api/games/{game_id}/legs  — pick-list reshape of board rows
+# ===========================================================================
+
+@app.get("/api/games/{game_id}/legs", tags=["api"])
+async def api_game_legs(
+    game_id: int,
+    bankroll: float = Query(default=1000.0, gt=0),
+    n_sims: int = Query(default=20_000, ge=500, le=200_000),
+) -> dict:
+    """
+    Reshape the board rows for *game_id* into a flat pick-list that the
+    SGP Builder frontend can render as checkboxes.
+
+    Each leg gets a stable ``leg_id`` of the form ``{game_id}:{market}:{side}``
+    so the evaluate endpoint can look them up without round-tripping to the
+    database.
+
+    Response shape (envelope):
+    {
+      "data": {
+        "game_id":   int,
+        "home_team": str,
+        "away_team": str,
+        "legs": [
+          {
+            "leg_id":          str,    // "{game_id}:{market}:{side}"
+            "description":     str,    // human-readable e.g. "NYY ML"
+            "market_type":     str,    // "moneyline"|"spread"|"total"|"batter_prop"|"pitcher_prop"
+            "side":            str,
+            "line":            float | null,
+            "current_odds":    float | null,
+            "model_prob":      float,
+            "market_prob":     float | null,
+            "edge":            float | null,
+            "ev_per_dollar":   float | null,
+            "confidence_score": float,
+          }, ...
+        ],
+        "cache_ready": bool   // false if sim cache not yet built
+      },
+      "meta": { ... }
+    }
+    """
+    # Reuse the board endpoint logic — call it internally via the simulation
+    # cache so we don't re-run the sim.  We only need the rows.
+    board_env = await api_game_board(
+        game_id=game_id,
+        bankroll=bankroll,
+        devig="power",
+        n_sims=n_sims,
+        n_boot=200,          # small — legs endpoint doesn't expose CI
+    )
+    board = board_env["data"]
+    legs = []
+    for row in board["rows"]:
+        market_key = f"{row['category']}_{row['side']}"
+        if row.get("line") is not None:
+            market_key += f"_{row['line']}"
+        leg_id = f"{game_id}:{market_key}"
+        legs.append({
+            "leg_id":           leg_id,
+            "description":      row["label"],
+            "market_type":      row["category"],
+            "side":             row["side"],
+            "line":             row.get("line"),
+            "current_odds":     row.get("market_odds"),
+            "model_prob":       row["model_prob"],
+            "market_prob":      row.get("market_prob"),
+            "edge":             row.get("edge"),
+            "ev_per_dollar":    row.get("ev_per_dollar"),
+            "confidence_score": row.get("confidence_score", 0.0),
+        })
+
+    return _envelope({
+        "game_id":    game_id,
+        "home_team":  board["home_team"],
+        "away_team":  board["away_team"],
+        "legs":       legs,
+        "cache_ready": game_id in _raw_sim_cache,
+    })
+
+
+# ===========================================================================
+# POST /api/parlays/evaluate  — naive vs correlation-adjusted joint Kelly
+# ===========================================================================
+
+class _EvalLeg(BaseModel):
+    """One leg submitted to POST /api/parlays/evaluate."""
+    leg_id:      str   = Field(description="Stable leg identifier from /legs endpoint.")
+    game_id:     int   = Field(description="MLB game_pk this leg belongs to.")
+    description: str   = Field(default="", description="Human-readable label.")
+    side:        str   = Field(default="home")
+    market_type: str   = Field(default="moneyline")
+    model_prob:  float = Field(ge=0.001, le=0.999, description="Model win probability.")
+    market_odds: Optional[float] = Field(default=None, description="American odds.")
+    line:        Optional[float] = Field(default=None)
+
+
+class _EvalRequest(BaseModel):
+    legs:     list[_EvalLeg] = Field(min_length=2, max_length=10)
+    bankroll: float          = Field(default=1000.0, gt=0)
+    n_sims:   int            = Field(default=10_000, ge=1_000, le=50_000)
+
+
+@app.post("/api/parlays/evaluate", tags=["api"])
+async def api_parlay_evaluate(body: _EvalRequest) -> dict:
+    """
+    Evaluate a user-assembled parlay.
+
+    Legs from the **same game_id** share empirical Monte Carlo correlation
+    (same simulator run, outcome matrix).  Legs from **different game_ids**
+    are treated as independent (no cross-game correlation mechanism exists).
+
+    Response shape (envelope):
+    {
+      "data": {
+        "legs": [ { leg_id, description, model_prob, marginal_prob, ... }, ... ],
+        "groups": [ { game_id, leg_ids, joint_prob_corr, joint_prob_naive }, ... ],
+        "joint_prob_corr_adjusted": float,
+        "joint_prob_naive":         float,
+        "parlay_net_payout":        float,
+        "pct_diff_corr_vs_naive":   float,   // (corr - naive) / naive * 100
+        "kelly": { "corr_adjusted": {...}, "naive": {...} },
+        "n_sims": int
+      },
+      "meta": { ... }
+    }
+    """
+    from src.optimizer.kelly import simulate_corr_matrix   # noqa: PLC0415
+
+    legs      = body.legs
+    bankroll  = body.bankroll
+    n_sims    = body.n_sims
+
+    # ── Group legs by game_id ────────────────────────────────────────────────
+    from collections import defaultdict
+    game_groups: dict[int, list[_EvalLeg]] = defaultdict(list)
+    for leg in legs:
+        game_groups[leg.game_id].append(leg)
+
+    # ── For each group, derive marginal sim probabilities ────────────────────
+    # SGP groups (≥2 legs, same game) → run simulate_corr_matrix
+    # Solo legs (1 leg in group) → use model_prob directly (no correlation)
+    pa_base = _league_avg_pa_probs()
+
+    group_summaries = []
+    leg_marginals: dict[str, float] = {}   # leg_id → marginal prob
+    game_joint_corr: dict[int, float] = {} # game_id → corr-adjusted joint prob
+    game_joint_naive: dict[int, float] = {}
+
+    for gid, gleg_list in game_groups.items():
+        if len(gleg_list) == 1:
+            leg = gleg_list[0]
+            leg_marginals[leg.leg_id] = leg.model_prob
+            game_joint_corr[gid]  = leg.model_prob
+            game_joint_naive[gid] = leg.model_prob
+            group_summaries.append({
+                "game_id":          gid,
+                "leg_ids":          [leg.leg_id],
+                "joint_prob_corr":  round(leg.model_prob, 5),
+                "joint_prob_naive": round(leg.model_prob, 5),
+                "note":             "single-leg: correlation not applicable",
+            })
+            continue
+
+        # Build leg dicts for simulate_corr_matrix
+        leg_dicts = []
+        for leg in gleg_list:
+            d: dict = {
+                "pa_probs_home": pa_base,
+                "pa_probs_away": pa_base,
+                "side":          leg.side,
+                "outcome":       leg.market_type if leg.market_type in
+                                 ("moneyline", "spread", "over", "under") else "moneyline",
+                "label":         leg.description or leg.leg_id,
+            }
+            if leg.line is not None:
+                if leg.market_type in ("over", "under", "total"):
+                    d["total_line"] = float(leg.line)
+                    d["outcome"] = "over" if leg.market_type in ("over", "total") else "under"
+                elif leg.market_type == "spread":
+                    d["run_line"] = float(leg.line)
+            leg_dicts.append(d)
+
+        try:
+            sim_corr = simulate_corr_matrix(
+                leg_dicts, n_sims=n_sims,
+                rng=np.random.default_rng(seed=gid % (2**32)),
+            )
+            clamped = np.clip(sim_corr.win_probs, 0.0001, 0.9999)
+            for i, leg in enumerate(gleg_list):
+                leg_marginals[leg.leg_id] = float(clamped[i])
+            all_win = sim_corr.outcome_matrix.min(axis=0) > 0.5
+            j_corr  = float(all_win.mean())
+            j_naive = float(np.prod(clamped))
+        except Exception as exc:
+            logger.warning("parlay_evaluate sim failed for game_id=%d: %s", gid, exc)
+            # Fall back to independent model_probs
+            for leg in gleg_list:
+                leg_marginals[leg.leg_id] = leg.model_prob
+            j_corr  = float(np.prod([l.model_prob for l in gleg_list]))
+            j_naive = j_corr
+
+        game_joint_corr[gid]  = j_corr
+        game_joint_naive[gid] = j_naive
+        group_summaries.append({
+            "game_id":          gid,
+            "leg_ids":          [l.leg_id for l in gleg_list],
+            "joint_prob_corr":  round(j_corr,  5),
+            "joint_prob_naive": round(j_naive, 5),
+        })
+
+    # ── Full-parlay joint prob = product of group joint probs ────────────────
+    joint_corr  = float(np.prod(list(game_joint_corr.values())))
+    joint_naive = float(np.prod(list(game_joint_naive.values())))
+
+    # ── Parlay net payout (b) ────────────────────────────────────────────────
+    decimal_payouts = []
+    for leg in legs:
+        if leg.market_odds is not None:
+            a = float(leg.market_odds)
+            dec = (a / 100.0 + 1.0) if a >= 100.0 else (100.0 / abs(a) + 1.0)
+        else:
+            dec = 1.909  # -110 default
+        decimal_payouts.append(dec)
+    parlay_net_payout = float(np.prod(decimal_payouts)) - 1.0
+
+    # ── Kelly sizing ─────────────────────────────────────────────────────────
+    def _pk(p: float, b: float) -> dict:
+        if b <= 0.0 or not (0.0 < p < 1.0):
+            return {"ev": 0.0, "f_star": 0.0, "f_quarter": 0.0, "stake_units": 0.0}
+        ev     = b * p - (1.0 - p)
+        f_star = max(ev / b, 0.0)
+        f_qk   = f_star / 4.0
+        return {
+            "ev":          round(ev,              6),
+            "f_star":      round(f_star,           6),
+            "f_quarter":   round(f_qk,             6),
+            "stake_units": round(f_qk * bankroll,  4),
+        }
+
+    kelly_corr  = _pk(joint_corr,  parlay_net_payout)
+    kelly_naive = _pk(joint_naive, parlay_net_payout)
+
+    pct_diff = (
+        (joint_corr - joint_naive) / max(joint_naive, 1e-9) * 100.0
+        if joint_naive > 1e-9 else 0.0
+    )
+
+    leg_out = []
+    for leg in legs:
+        leg_out.append({
+            "leg_id":       leg.leg_id,
+            "game_id":      leg.game_id,
+            "description":  leg.description,
+            "side":         leg.side,
+            "market_type":  leg.market_type,
+            "line":         leg.line,
+            "market_odds":  leg.market_odds,
+            "model_prob":   leg.model_prob,
+            "marginal_prob": round(leg_marginals.get(leg.leg_id, leg.model_prob), 5),
+        })
+
+    return _envelope({
+        "legs":                       leg_out,
+        "groups":                     group_summaries,
+        "joint_prob_corr_adjusted":   round(joint_corr,          5),
+        "joint_prob_naive":           round(joint_naive,         5),
+        "parlay_net_payout":          round(parlay_net_payout,   4),
+        "pct_diff_corr_vs_naive":     round(pct_diff,            2),
+        "kelly": {
+            "corr_adjusted": kelly_corr,
+            "naive":         kelly_naive,
+        },
+        "n_sims": n_sims,
+    })
+
+
+# ===========================================================================
+# GET /api/parlays/suggested  — optimizer-generated top-N parlay candidates
+# ===========================================================================
+
+_MAX_SGP_LEGS    = 4
+_MIN_SGP_LEGS    = 2
+_TOP_N_PARLAYS   = 5
+_TOP_N_CROSSGAME = 5
+_TOP_PICKS_POOL  = 12   # top legs per game considered for cross-game pool
+
+
+@app.get("/api/parlays/suggested", tags=["api"])
+async def api_parlays_suggested(
+    bankroll: float = Query(default=1000.0, gt=0),
+    mode: str = Query(
+        default="sgp",
+        description="'sgp' — same-game combos; 'crossgame' — cross-game picks",
+    ),
+    date: Optional[str] = Query(default=None),
+    n_sims: int = Query(default=8_000, ge=1_000, le=50_000),
+) -> dict:
+    """
+    Suggest the highest-EV parlay candidates.
+
+    SGP mode
+    --------
+    For each game on today's slate:
+      1. Fetch the game's board (via cache if already built).
+      2. Enumerate all 2-, 3-, and 4-leg combinations of the top-12 legs
+         (by confidence_score) — max C(12,4)=495 combos per game, fast.
+      3. For each combo, run simulate_corr_matrix to get corr-adjusted
+         joint prob.  Compute Kelly EV.
+      4. Return the top-N across all games.
+
+    Cross-game mode
+    ---------------
+    1. Collect the single highest-confidence leg from each game.
+    2. Enumerate all 2- and 3-leg cross-game combos.  Treat as independent
+       (no cross-game correlation mechanism).
+    3. Return the top-N by naive EV (= corr-adjusted for independent legs).
+
+    Empty-state handling
+    --------------------
+    If fewer than 2 legs are available for any game (board error, no odds),
+    that game is skipped and a reason is included in "skipped_games".
+    If no parlays can be built at all, "parlays" is an empty list with
+    "message" explaining why.
+
+    Response shape (envelope):
+    {
+      "data": {
+        "mode":          str,
+        "parlays": [
+          {
+            "rank":               int,
+            "legs":               [ <leg object>, ... ],
+            "game_ids":           [int, ...],
+            "joint_prob_corr":    float,
+            "joint_prob_naive":   float,
+            "parlay_net_payout":  float,
+            "ev":                 float,
+            "kelly_stake":        float,
+            "ci_low":             float,   // bootstrap 5th pctile on joint prob
+            "ci_high":            float,   //                        95th pctile
+          }, ...
+        ],
+        "skipped_games": [ { "game_id": int, "reason": str }, ... ],
+        "message":       str | null
+      },
+      "meta": { ... }
+    }
+    """
+    from itertools import combinations as _comb   # noqa: PLC0415
+    from src.optimizer.kelly import simulate_corr_matrix  # noqa: PLC0415
+
+    game_date = date or _today_iso()
+    mode      = mode.lower()
+    if mode not in ("sgp", "crossgame"):
+        raise HTTPException(status_code=422, detail="mode must be 'sgp' or 'crossgame'")
+
+    pa_base       = _league_avg_pa_probs()
+    skipped_games: list[dict] = []
+    candidates:    list[dict] = []
+
+    # ── Helper: build leg dicts for simulate_corr_matrix ────────────────────
+    def _to_sim_leg(board_row: dict) -> dict:
+        cat = board_row.get("category", "moneyline")
+        out = cat if cat in ("moneyline", "spread", "over", "under") else "moneyline"
+        d: dict = {
+            "pa_probs_home": pa_base,
+            "pa_probs_away": pa_base,
+            "side":    board_row.get("side", "home"),
+            "outcome": out,
+            "label":   board_row.get("label", ""),
+        }
+        ln = board_row.get("line")
+        if ln is not None:
+            if cat in ("total", "over", "under"):
+                d["total_line"] = float(ln)
+                d["outcome"] = "over" if cat in ("over", "total") else "under"
+            elif cat == "spread":
+                d["run_line"] = float(ln)
+        return d
+
+    # ── Helper: parlay payout from a list of board rows ──────────────────────
+    def _net_payout(rows: list[dict]) -> float:
+        prod = 1.0
+        for r in rows:
+            a = r.get("market_odds")
+            if a is not None:
+                prod *= (a / 100.0 + 1.0) if a >= 100.0 else (100.0 / abs(a) + 1.0)
+            else:
+                prod *= 1.909
+        return prod - 1.0
+
+    # ── Helper: Kelly EV for a parlay ────────────────────────────────────────
+    def _parlay_ev(p: float, b: float) -> float:
+        return b * p - (1.0 - p) if b > 0.0 and 0.0 < p < 1.0 else 0.0
+
+    def _parlay_stake(p: float, b: float) -> float:
+        if b <= 0.0 or not (0.0 < p < 1.0):
+            return 0.0
+        ev = b * p - (1.0 - p)
+        f  = max(ev / b, 0.0) / 4.0
+        return round(f * bankroll, 2)
+
+    # ── Helper: bootstrap CI on joint prob ───────────────────────────────────
+    rng_global = np.random.default_rng(42)
+
+    def _joint_ci(outcome_row: np.ndarray, n_boot: int = 200) -> tuple[float, float]:
+        n = len(outcome_row)
+        if n < 20:
+            p = float(outcome_row.mean())
+            return p, p
+        boots = np.array([
+            outcome_row[rng_global.integers(0, n, size=n)].mean()
+            for _ in range(n_boot)
+        ])
+        return float(np.percentile(boots, 5)), float(np.percentile(boots, 95))
+
+    # ── Fetch today's schedule ────────────────────────────────────────────────
+    from src.ingestion.mlb_stats_api import _load_or_fetch   # noqa: PLC0415
+    try:
+        raw_sched = _load_or_fetch(
+            cache_key=f"schedule_{game_date}",
+            endpoint="schedule",
+            params={"sportId": 1, "date": game_date,
+                    "hydrate": "team,venue,probablePitcher"},
+            force_refresh=False,
+        )
+        game_ids = [
+            int(g.get("gamePk", 0))
+            for de in raw_sched.get("dates", [])
+            for g in de.get("games", [])
+        ]
+        game_ids = [gid for gid in game_ids if gid]
+    except Exception as exc:
+        logger.error("suggested_parlays: schedule fetch failed: %s", exc)
+        raise HTTPException(status_code=502, detail="MLB Stats API unavailable") from None
+
+    if not game_ids:
+        return _envelope({
+            "mode":          mode,
+            "parlays":       [],
+            "skipped_games": [],
+            "message":       f"No games scheduled for {game_date}.",
+        })
+
+    # ── SGP mode ──────────────────────────────────────────────────────────────
+    if mode == "sgp":
+        for gid in game_ids:
+            try:
+                board_env = await api_game_board(
+                    game_id=gid, bankroll=bankroll,
+                    devig="power", n_sims=n_sims, n_boot=200,
+                )
+                board_rows = board_env["data"]["rows"]
+            except Exception as exc:
+                skipped_games.append({"game_id": gid, "reason": str(exc)})
+                continue
+
+            # Take top-N by confidence_score; cap pool for search tractability
+            pool = board_rows[:_TOP_PICKS_POOL]
+            if len(pool) < _MIN_SGP_LEGS:
+                skipped_games.append({
+                    "game_id": gid,
+                    "reason":  f"Only {len(pool)} leg(s) available — need ≥ {_MIN_SGP_LEGS}",
+                })
+                continue
+
+            for n_legs in range(_MIN_SGP_LEGS, min(_MAX_SGP_LEGS + 1, len(pool) + 1)):
+                for combo in _comb(range(len(pool)), n_legs):
+                    rows_sel = [pool[i] for i in combo]
+                    sim_legs = [_to_sim_leg(r) for r in rows_sel]
+                    b        = _net_payout(rows_sel)
+                    try:
+                        sc = simulate_corr_matrix(
+                            sim_legs, n_sims=n_sims,
+                            rng=np.random.default_rng(seed=(gid + sum(combo)) % (2**32)),
+                        )
+                        all_win  = sc.outcome_matrix.min(axis=0) > 0.5
+                        j_corr   = float(all_win.mean())
+                        j_naive  = float(np.prod(np.clip(sc.win_probs, 0.0001, 0.9999)))
+                        ev_val   = _parlay_ev(j_corr, b)
+                        ci_lo, ci_hi = _joint_ci(all_win.astype(np.float64))
+                        candidates.append({
+                            "game_ids":          [gid],
+                            "legs": [
+                                {
+                                    "leg_id":       f"{gid}:{r['category']}_{r['side']}"
+                                                    + (f"_{r['line']}" if r.get("line") is not None else ""),
+                                    "description":  r["label"],
+                                    "market_type":  r["category"],
+                                    "side":         r["side"],
+                                    "line":         r.get("line"),
+                                    "model_prob":   r["model_prob"],
+                                    "market_odds":  r.get("market_odds"),
+                                }
+                                for r in rows_sel
+                            ],
+                            "joint_prob_corr":   round(j_corr,  5),
+                            "joint_prob_naive":  round(j_naive, 5),
+                            "parlay_net_payout": round(b,        4),
+                            "ev":                round(ev_val,   5),
+                            "kelly_stake":       _parlay_stake(j_corr, b),
+                            "ci_low":            round(ci_lo,   5),
+                            "ci_high":           round(ci_hi,   5),
+                        })
+                    except Exception as exc:
+                        logger.debug("SGP combo sim failed game=%d legs=%s: %s", gid, combo, exc)
+                        continue
+
+    # ── Cross-game mode ───────────────────────────────────────────────────────
+    else:
+        best_legs_per_game: list[dict] = []
+        for gid in game_ids:
+            try:
+                board_env = await api_game_board(
+                    game_id=gid, bankroll=bankroll,
+                    devig="power", n_sims=n_sims, n_boot=200,
+                )
+                board_rows = board_env["data"]["rows"]
+            except Exception as exc:
+                skipped_games.append({"game_id": gid, "reason": str(exc)})
+                continue
+
+            # Take only the single best positive-edge leg from this game
+            pos_edge = [r for r in board_rows
+                        if r.get("edge") is not None and r["edge"] > 0]
+            pool = (pos_edge or board_rows)[:_TOP_PICKS_POOL]
+            if not pool:
+                skipped_games.append({"game_id": gid, "reason": "No legs available"})
+                continue
+            best_legs_per_game.append({
+                "game_id":    gid,
+                "board_rows": pool,
+            })
+
+        if len(best_legs_per_game) < 2:
+            return _envelope({
+                "mode":          mode,
+                "parlays":       [],
+                "skipped_games": skipped_games,
+                "message":       "Need ≥ 2 games with available odds for cross-game parlays.",
+            })
+
+        # Enumerate 2- and 3-game cross-game combos; take best leg from each game
+        for n_games in (2, 3):
+            if n_games > len(best_legs_per_game):
+                continue
+            for game_combo in _comb(range(len(best_legs_per_game)), n_games):
+                for leg_indices in _comb(
+                    range(min(_TOP_PICKS_POOL, 5)), n_games
+                ):
+                    rows_sel = []
+                    game_ids_sel = []
+                    valid = True
+                    for gi, li in zip(game_combo, leg_indices):
+                        g_entry = best_legs_per_game[gi]
+                        pool    = g_entry["board_rows"]
+                        if li >= len(pool):
+                            valid = False
+                            break
+                        rows_sel.append(pool[li])
+                        game_ids_sel.append(g_entry["game_id"])
+                    if not valid:
+                        continue
+
+                    b       = _net_payout(rows_sel)
+                    j_naive = float(np.prod([r["model_prob"] for r in rows_sel]))
+                    ev_val  = _parlay_ev(j_naive, b)  # independent: corr == naive
+                    candidates.append({
+                        "game_ids":          game_ids_sel,
+                        "legs": [
+                            {
+                                "leg_id":       f"{gid}:{r['category']}_{r['side']}"
+                                                + (f"_{r['line']}" if r.get("line") is not None else ""),
+                                "description":  r["label"],
+                                "market_type":  r["category"],
+                                "side":         r["side"],
+                                "line":         r.get("line"),
+                                "model_prob":   r["model_prob"],
+                                "market_odds":  r.get("market_odds"),
+                            }
+                            for r, gid in zip(rows_sel, game_ids_sel)
+                        ],
+                        "joint_prob_corr":   round(j_naive, 5),  # independent
+                        "joint_prob_naive":  round(j_naive, 5),
+                        "parlay_net_payout": round(b,        4),
+                        "ev":                round(ev_val,   5),
+                        "kelly_stake":       _parlay_stake(j_naive, b),
+                        "ci_low":            round(j_naive, 5),   # no bootstrap for cross-game
+                        "ci_high":           round(j_naive, 5),
+                    })
+
+    # ── Sort & deduplicate by EV, return top-N ────────────────────────────────
+    candidates.sort(key=lambda c: c["ev"], reverse=True)
+
+    # Deduplicate: skip combos that share all leg_ids with a higher-ranked one
+    seen_sets: list[frozenset] = []
+    top_parlays = []
+    for c in candidates:
+        leg_set = frozenset(l["leg_id"] for l in c["legs"])
+        if any(leg_set == s for s in seen_sets):
+            continue
+        seen_sets.append(leg_set)
+        top_parlays.append(c)
+        if len(top_parlays) >= _TOP_N_PARLAYS:
+            break
+
+    # Add rank
+    for i, p in enumerate(top_parlays, start=1):
+        p["rank"] = i
+
+    message = None
+    if not top_parlays:
+        if skipped_games:
+            reasons = "; ".join(f"game {s['game_id']}: {s['reason']}" for s in skipped_games[:3])
+            message = f"No parlays could be built. Skipped games: {reasons}"
+        else:
+            message = "No positive-EV parlays found for today's slate."
+
+    return _envelope({
+        "mode":          mode,
+        "parlays":       top_parlays,
+        "skipped_games": skipped_games,
+        "message":       message,
     })
 
 

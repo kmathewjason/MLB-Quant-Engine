@@ -256,3 +256,95 @@ export interface BacktestData {
   calibration: CalibrationReport
   clv: { summary?: CLVSummary; available: boolean }
 }
+
+// ── /api/games/{id}/legs ────────────────────────────────────────────────────
+
+export interface GameLeg {
+  leg_id:           string
+  description:      string
+  market_type:      string
+  side:             string
+  line:             number | null
+  current_odds:     number | null
+  model_prob:       number
+  market_prob:      number | null
+  edge:             number | null
+  ev_per_dollar:    number | null
+  confidence_score: number
+}
+
+export interface GameLegsData {
+  game_id:     number
+  home_team:   string
+  away_team:   string
+  legs:        GameLeg[]
+  cache_ready: boolean
+}
+
+// ── /api/parlays/evaluate ───────────────────────────────────────────────────
+
+export interface ParlayLegInput {
+  leg_id:      string
+  game_id:     number
+  description: string
+  side:        string
+  market_type: string
+  model_prob:  number
+  market_odds: number | null
+  line:        number | null
+}
+
+export interface ParlayLegResult extends ParlayLegInput {
+  marginal_prob: number
+}
+
+export interface ParlayGroupSummary {
+  game_id:          number
+  leg_ids:          string[]
+  joint_prob_corr:  number
+  joint_prob_naive: number
+  note?:            string
+}
+
+export interface ParlayEvalResult {
+  legs:                      ParlayLegResult[]
+  groups:                    ParlayGroupSummary[]
+  joint_prob_corr_adjusted:  number
+  joint_prob_naive:          number
+  parlay_net_payout:         number
+  pct_diff_corr_vs_naive:    number
+  kelly:                     { corr_adjusted: KellyVariant; naive: KellyVariant }
+  n_sims:                    number
+}
+
+// ── /api/parlays/suggested ──────────────────────────────────────────────────
+
+export interface SuggestedParlayLeg {
+  leg_id:      string
+  description: string
+  market_type: string
+  side:        string
+  line:        number | null
+  model_prob:  number
+  market_odds: number | null
+}
+
+export interface SuggestedParlay {
+  rank:               number
+  legs:               SuggestedParlayLeg[]
+  game_ids:           number[]
+  joint_prob_corr:    number
+  joint_prob_naive:   number
+  parlay_net_payout:  number
+  ev:                 number
+  kelly_stake:        number
+  ci_low:             number
+  ci_high:            number
+}
+
+export interface SuggestedParlaysData {
+  mode:          string
+  parlays:       SuggestedParlay[]
+  skipped_games: { game_id: number; reason: string }[]
+  message:       string | null
+}

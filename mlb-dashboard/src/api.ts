@@ -21,6 +21,10 @@ import type {
   SGPLeg,
   SGPData,
   BacktestData,
+  GameLegsData,
+  ParlayLegInput,
+  ParlayEvalResult,
+  SuggestedParlaysData,
 } from './types'
 
 const DAILY_TIMEOUT_MS  = 25_000
@@ -145,6 +149,68 @@ export async function fetchSGP(
       bankroll,
       n_sims: nSims,
     })
+    return data
+  } catch (e) {
+    return apiError(e)
+  }
+}
+
+export async function fetchGameLegs(
+  gameId: number,
+  opts: { bankroll?: number; nSims?: number } = {},
+): Promise<Envelope<GameLegsData>> {
+  try {
+    const { data } = await client.get<Envelope<GameLegsData>>(
+      `/api/games/${gameId}/legs`,
+      {
+        params: {
+          ...(opts.bankroll !== undefined ? { bankroll: opts.bankroll } : {}),
+          ...(opts.nSims    !== undefined ? { n_sims:   opts.nSims    } : {}),
+        },
+        timeout: SIM_TIMEOUT_MS,
+      },
+    )
+    return data
+  } catch (e) {
+    return apiError(e)
+  }
+}
+
+export async function fetchEvaluateParlay(
+  legs: ParlayLegInput[],
+  bankroll = 1000,
+  nSims = 10_000,
+): Promise<Envelope<ParlayEvalResult>> {
+  try {
+    const { data } = await client.post<Envelope<ParlayEvalResult>>(
+      '/api/parlays/evaluate',
+      { legs, bankroll, n_sims: nSims },
+      { timeout: SIM_TIMEOUT_MS },
+    )
+    return data
+  } catch (e) {
+    return apiError(e)
+  }
+}
+
+export async function fetchSuggestedParlays(
+  mode: 'sgp' | 'crossgame',
+  bankroll = 1000,
+  opts: { date?: string; nSims?: number } = {},
+): Promise<Envelope<SuggestedParlaysData>> {
+  try {
+    const { data } = await client.get<Envelope<SuggestedParlaysData>>(
+      '/api/parlays/suggested',
+      {
+        params: {
+          mode,
+          bankroll,
+          ...(opts.date  ? { date:   opts.date  } : {}),
+          ...(opts.nSims ? { n_sims: opts.nSims } : {}),
+        },
+        timeout: SIM_TIMEOUT_MS,
+      },
+    )
     return data
   } catch (e) {
     return apiError(e)
