@@ -10,6 +10,64 @@ export interface Envelope<T> {
   meta: Meta
 }
 
+// ── /api/games/today ────────────────────────────────────────────────────────
+
+export interface GameStub {
+  game_id: number
+  game_date: string
+  start_time_utc: string
+  start_time_local: string
+  status: string
+  home_team: string
+  away_team: string
+  home_team_id: number
+  away_team_id: number
+  probable_pitcher_home: string
+  probable_pitcher_away: string
+  park_name: string
+  series: string
+}
+
+// ── /api/games/{id}/board ───────────────────────────────────────────────────
+
+export interface ConfidenceBlock {
+  point_estimate: number
+  ci_low: number
+  ci_high: number
+  ci_width: number
+}
+
+export type BoardCategory =
+  | 'moneyline'
+  | 'spread'
+  | 'total'
+  | 'batter_prop'
+  | 'pitcher_prop'
+
+export interface BoardRow {
+  category: BoardCategory
+  label: string
+  side: string
+  line: number | null
+  model_prob: number
+  market_prob: number | null
+  market_odds: number | null
+  edge: number | null
+  ev_per_dollar: number | null
+  kelly_stake: number | null
+  confidence: ConfidenceBlock
+  confidence_score: number
+}
+
+export interface BoardData {
+  game_id: number
+  home_team: string
+  away_team: string
+  n_sims: number
+  rows: BoardRow[]
+  omitted: { label: string; reason: string }[]
+}
+
 // ── /api/predictions/daily ─────────────────────────────────────────────────
 
 export interface RunDist {

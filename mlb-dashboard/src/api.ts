@@ -14,6 +14,8 @@
 import axios from 'axios'
 import type {
   Envelope,
+  GameStub,
+  BoardData,
   DailyGame,
   GameSimData,
   SGPLeg,
@@ -42,6 +44,51 @@ function apiError(err: unknown): never {
 }
 
 // ── endpoints ──────────────────────────────────────────────────────────────
+
+/**
+ * Fetch today's game list (schedule only — no simulation, no odds).
+ * Designed to respond in <1 s.
+ */
+export async function fetchGamesToday(date?: string): Promise<Envelope<GameStub[]>> {
+  try {
+    const { data } = await client.get<Envelope<GameStub[]>>('/api/games/today', {
+      params: date ? { date } : {},
+      timeout: 8_000,
+    })
+    return data
+  } catch (e) {
+    console.error('[fetchGamesToday] error:', e)
+    return apiError(e)
+  }
+}
+
+/**
+ * Fetch the full market board for a single game (simulation + odds + props).
+ * May take 5-30 s depending on n_sims and whether odds API is reachable.
+ */
+export async function fetchGameBoard(
+  gameId: number,
+  opts: { bankroll?: number; devig?: string; nSims?: number; nBoot?: number } = {},
+): Promise<Envelope<BoardData>> {
+  try {
+    const { data } = await client.get<Envelope<BoardData>>(
+      `/api/games/${gameId}/board`,
+      {
+        params: {
+          ...(opts.bankroll !== undefined ? { bankroll: opts.bankroll } : {}),
+          ...(opts.devig    !== undefined ? { devig:    opts.devig    } : {}),
+          ...(opts.nSims    !== undefined ? { n_sims:   opts.nSims    } : {}),
+          ...(opts.nBoot    !== undefined ? { n_boot:   opts.nBoot    } : {}),
+        },
+        timeout: SIM_TIMEOUT_MS,
+      },
+    )
+    return data
+  } catch (e) {
+    console.error('[fetchGameBoard] error:', e)
+    return apiError(e)
+  }
+}
 
 /**
  * Fetch today's (or a specific date's) slate of games with simulation data.

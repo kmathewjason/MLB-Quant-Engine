@@ -1081,6 +1081,437 @@ async def api_backtest_report() -> dict:
 
 
 # ===========================================================================
+# GET /api/games/today  — lightweight schedule list, no simulation
+# ===========================================================================
+
+@app.get("/api/games/today", tags=["api"])
+async def api_games_today(
+    date: Optional[str] = Query(
+        default=None,
+        description="ISO date (YYYY-MM-DD). Defaults to today.",
+    ),
+) -> dict:
+    """
+    Return today's MLB schedule as a lightweight list — NO odds, NO simulation.
+    Designed to load in well under a second so the Slate landing page is instant.
+
+    Response shape (envelope):
+    {
+      "data": [
+        {
+          "game_id":   int,          // MLB game_pk
+          "game_date": str,          // "2025-06-15"
+          "start_time_utc": str,     // ISO-8601 UTC
+          "start_time_local": str,   // "1:05 PM" derived from UTC (best-effort)
+          "status": str,             // "Scheduled" | "In Progress" | etc.
+          "home_team": str,
+          "away_team": str,
+          "home_team_id": int,
+          "away_team_id": int,
+          "probable_pitcher_home": str,   // full name or "TBD"
+          "probable_pitcher_away": str,
+          "park_name": str,
+          "series": str               // "Regular Season" etc.
+        }, ...
+      ],
+      "meta": { "generated_at": str, "version": str }
+    }
+    """
+    from src.ingestion.mlb_stats_api import _load_or_fetch  # noqa: PLC0415
+
+    game_date = date or _today_iso()
+
+    try:
+        raw = _load_or_fetch(
+            cache_key=f"schedule_{game_date}",
+            endpoint="schedule",
+            params={
+                "sportId": 1,
+                "date": game_date,
+                "hydrate": "team,venue,probablePitcher,seriesStatus",
+            },
+            force_refresh=False,
+        )
+    except Exception as exc:
+        logger.error("Schedule fetch failed for %s: %s", game_date, exc)
+        raise HTTPException(status_code=502, detail="MLB Stats API unavailable") from None
+
+    games_out: list[dict] = []
+    for date_entry in raw.get("dates", []):
+        for g in date_entry.get("games", []):
+            teams = g.get("teams", {})
+            home  = teams.get("home", {})
+            away  = teams.get("away", {})
+
+            def _pp_name(side: dict) -> str:
+                pp = side.get("probablePitcher")
+                if not pp:
+                    return "TBD"
+                return pp.get("fullName", "TBD") or "TBD"
+
+            # Convert UTC game time to a friendly local-ish time string (ET assumed)
+            start_utc = g.get("gameDate", "")
+            start_local = "TBD"
+            if start_utc:
+                try:
+                    import datetime as _dt
+                    utc_dt = _dt.datetime.fromisoformat(start_utc.replace("Z", "+00:00"))
+                    # Eastern offset: -5 (EST) or -4 (EDT); use fixed -4 for baseball season
+                    et_dt = utc_dt.replace(tzinfo=None) + _dt.timedelta(hours=-4)
+                    start_local = et_dt.strftime("%-I:%M %p ET").replace("PM", "PM").replace("AM", "AM")
+                except Exception:
+                    start_local = start_utc
+
+            games_out.append({
+                "game_id":              int(g.get("gamePk", 0)),
+                "game_date":            g.get("officialDate", game_date),
+                "start_time_utc":       start_utc,
+                "start_time_local":     start_local,
+                "status":               g.get("status", {}).get("detailedState", ""),
+                "home_team":            home.get("team", {}).get("name", ""),
+                "away_team":            away.get("team", {}).get("name", ""),
+                "home_team_id":         home.get("team", {}).get("id", 0),
+                "away_team_id":         away.get("team", {}).get("id", 0),
+                "probable_pitcher_home": _pp_name(home),
+                "probable_pitcher_away": _pp_name(away),
+                "park_name":            g.get("venue", {}).get("name", ""),
+                "series":               g.get("seriesDescription", "Regular Season"),
+            })
+
+    return _envelope(games_out)
+
+
+# ===========================================================================
+# GET /api/games/{game_id}/board  — full market board with bootstrap CI
+# ===========================================================================
+
+@app.get("/api/games/{game_id}/board", tags=["api"])
+async def api_game_board(
+    game_id: int,
+    bankroll: float = Query(default=1000.0, gt=0, description="Bankroll for Kelly sizing."),
+    devig: str = Query(default="power", description="De-vig method: power | additive | shin"),
+    n_sims: int = Query(default=20_000, ge=500, le=200_000, description="MC simulations."),
+    n_boot: int = Query(default=500, ge=100, le=2000, description="Bootstrap resamples for CI."),
+) -> dict:
+    """
+    Full market board for one game: game-level markets + player props.
+
+    For every row:
+    - model_probability: from MC simulation
+    - market_prob_devigged: power-devigged market implied probability
+    - edge: model_prob − market_prob
+    - ev_per_dollar: b·p − q
+    - kelly_stake: quarter-Kelly × bankroll
+    - confidence: { point_estimate, ci_low, ci_high } — bootstrap 5th/95th pctile
+    - confidence_score: edge / max(ci_width, 0.01)  — used for default sort
+
+    Props whose simulation or odds lookup fails are excluded and listed in
+    "omitted_props" with a reason string.
+
+    Response shape (envelope):
+    {
+      "data": {
+        "game_id": int,
+        "home_team": str,
+        "away_team": str,
+        "n_sims": int,
+        "rows": [ <BoardRow>, ... ],   // sorted by confidence_score desc
+        "omitted": [ { "label": str, "reason": str }, ... ]
+      },
+      "meta": { ... }
+    }
+    """
+    from src.ingestion.player_stats import get_game_pa_probs  # noqa: PLC0415
+    from src.optimizer.vig_removal import best_devig          # noqa: PLC0415
+    from src.optimizer.kelly import kelly_fraction, kelly_ev  # noqa: PLC0415
+    from src.ingestion.mlb_stats_api import _load_or_fetch    # noqa: PLC0415
+
+    omitted: list[dict] = []
+
+    # ── 1. Get game metadata from schedule cache ──────────────────────────
+    home_team = "Home"
+    away_team = "Away"
+    try:
+        game_date = _today_iso()
+        raw_sched = _load_or_fetch(
+            cache_key=f"schedule_{game_date}",
+            endpoint="schedule",
+            params={"sportId": 1, "date": game_date,
+                    "hydrate": "team,venue,probablePitcher"},
+            force_refresh=False,
+        )
+        for de in raw_sched.get("dates", []):
+            for g in de.get("games", []):
+                if int(g.get("gamePk", 0)) == game_id:
+                    teams = g.get("teams", {})
+                    home_team = teams.get("home", {}).get("team", {}).get("name", "Home")
+                    away_team = teams.get("away", {}).get("team", {}).get("name", "Away")
+                    break
+    except Exception as exc:
+        logger.warning("game_board: schedule lookup failed for %d: %s", game_id, exc)
+
+    # ── 2. Run simulation (uses real player stats via log5) ───────────────
+    if game_id not in _raw_sim_cache:
+        try:
+            pa_home, pa_away = get_game_pa_probs(game_id)
+        except Exception as exc:
+            logger.warning("game_board: player stats failed game_id=%d: %s", game_id, exc)
+            pa_home = pa_away = _league_avg_pa_probs()
+        raw_result = _build_raw_game_result(pa_home, pa_away, n_sims)
+        _raw_sim_cache[game_id] = raw_result
+    else:
+        raw_result = _raw_sim_cache[game_id]
+
+    home_runs = raw_result.home_runs_dist.astype(np.float64)
+    away_runs = raw_result.away_runs_dist.astype(np.float64)
+    total_runs = home_runs + away_runs
+    margin     = home_runs - away_runs
+
+    # ── 3. Fetch live odds (h2h + spreads + totals) ───────────────────────
+    game_odds: dict = {}
+    odds_api_event_id: str | None = None
+    odds_key = os.environ.get("ODDS_API_KEY", "")
+    if odds_key:
+        try:
+            from src.ingestion.live_odds import get_game_odds  # noqa: PLC0415
+            raw_odds_all = get_game_odds(
+                markets=("h2h", "spreads", "totals"), try_once=True
+            )
+            all_indexed = _index_all_odds(raw_odds_all)
+            game_odds = all_indexed.get(home_team, {})
+            # Also grab the Odds API event ID for props lookup
+            h2h_events = get_game_odds(markets=("h2h",), try_once=True)
+            for ev in h2h_events:
+                if ev.get("home_team") == home_team or ev.get("away_team") == away_team:
+                    odds_api_event_id = ev.get("game_id")
+                    break
+        except Exception as exc:
+            logger.warning("game_board: odds fetch failed game_id=%d: %s", game_id, exc)
+
+    # ── 4. Bootstrap CI helper ────────────────────────────────────────────
+    rng = np.random.default_rng(seed=game_id % (2**32))
+
+    def _bootstrap_ci(
+        values: np.ndarray,
+        stat_fn,
+        n_boot: int = n_boot,
+        lo: float = 5.0,
+        hi: float = 95.0,
+    ) -> tuple[float, float]:
+        """
+        Bootstrap percentile CI for a scalar statistic computed from *values*.
+        stat_fn(v) returns a scalar probability; v is a bootstrap resample.
+        """
+        n = len(values)
+        if n < 10:
+            p = float(stat_fn(values))
+            return p, p
+        stats = np.empty(n_boot, dtype=np.float64)
+        for i in range(n_boot):
+            idx = rng.integers(0, n, size=n)
+            stats[i] = stat_fn(values[idx])
+        return float(np.percentile(stats, lo)), float(np.percentile(stats, hi))
+
+    # ── 5. Build board rows ────────────────────────────────────────────────
+    rows: list[dict] = []
+
+    def _add_row(
+        category: str,
+        label: str,
+        side: str,
+        line: float | None,
+        model_p: float,
+        sim_values: np.ndarray,   # the raw distribution to bootstrap against
+        stat_fn,                   # callable(arr) → probability estimate
+        mkt_odds: float | None,
+        mkt_pair_odds: float | None,  # the OTHER side's odds (for devig)
+    ) -> None:
+        """Build one board row and append to `rows`, or add to `omitted`."""
+        try:
+            # Bootstrap CI on the model probability
+            ci_lo, ci_hi = _bootstrap_ci(sim_values, stat_fn)
+            point_est = float(stat_fn(sim_values))
+
+            # Market probability (devigged)
+            mkt_prob: float | None = None
+            ev: float | None = None
+            edge: float | None = None
+            kf: float | None = None
+            stake: float | None = None
+
+            if mkt_odds is not None and mkt_pair_odds is not None:
+                try:
+                    fair = best_devig([mkt_odds, mkt_pair_odds], method=devig)
+                    mkt_prob = float(fair[0])
+                    edge = round(point_est - mkt_prob, 5)
+                    ev   = round(kelly_ev(point_est, mkt_odds), 5)
+                    if ev > 0.0:
+                        kf    = round(kelly_fraction(point_est, mkt_odds, 1.0), 6)
+                        stake = round(kelly_fraction(point_est, mkt_odds, 4.0) * bankroll, 2)
+                except Exception:
+                    pass
+
+            ci_width = max(ci_hi - ci_lo, 1e-4)
+            conf_score = (edge / ci_width) if edge is not None else (
+                (point_est - 0.5) / ci_width
+            )
+
+            rows.append({
+                "category":        category,
+                "label":           label,
+                "side":            side,
+                "line":            line,
+                "model_prob":      round(point_est, 5),
+                "market_prob":     round(mkt_prob, 5) if mkt_prob is not None else None,
+                "market_odds":     mkt_odds,
+                "edge":            edge,
+                "ev_per_dollar":   ev,
+                "kelly_stake":     stake,
+                "confidence": {
+                    "point_estimate": round(point_est, 5),
+                    "ci_low":         round(ci_lo, 5),
+                    "ci_high":        round(ci_hi, 5),
+                    "ci_width":       round(ci_width, 5),
+                },
+                "confidence_score": round(conf_score, 6),
+            })
+        except Exception as exc:
+            omitted.append({"label": label, "reason": str(exc)})
+
+    # --- Moneyline ---
+    h2h = game_odds.get("h2h", {})
+    home_ml = h2h.get("home_odds")
+    away_ml = h2h.get("away_odds")
+    _add_row(
+        "moneyline", f"{home_team} ML", "home", None,
+        float(raw_result.win_prob_home),
+        margin, lambda v: float((v > 0).mean()),
+        home_ml, away_ml,
+    )
+    _add_row(
+        "moneyline", f"{away_team} ML", "away", None,
+        float(raw_result.win_prob_away),
+        margin, lambda v: float((v < 0).mean()),
+        away_ml, home_ml,
+    )
+
+    # --- Run line ---
+    spread_odds = game_odds.get("spreads", {})
+    for run_line, side_key, label_team in [
+        (-1.5, "home", home_team), (1.5, "away", away_team)
+    ]:
+        rl_mkt  = spread_odds.get(f"{side_key}_odds")
+        rl_opp  = spread_odds.get("away_odds" if side_key == "home" else "home_odds")
+        rl_fn   = (lambda rl: lambda v: float((v > rl).mean()))(run_line)
+        _add_row(
+            "spread", f"{label_team} {run_line:+.1f}", side_key, run_line,
+            float(raw_result.spread_cover_prob(run_line)),
+            margin, rl_fn,
+            rl_mkt, rl_opp,
+        )
+
+    # --- Totals (from odds API + model-only fallbacks) ---
+    totals_odds = game_odds.get("totals", {})
+    seen_total_lines: set[float] = set()
+
+    for key, t_odds in totals_odds.items():
+        parts = key.split("_")
+        if len(parts) != 2:
+            continue
+        side_str, line_str = parts
+        try:
+            tline = float(line_str)
+        except ValueError:
+            continue
+        seen_total_lines.add(tline)
+        opp_key  = f"{'under' if side_str == 'over' else 'over'}_{line_str}"
+        opp_odds = totals_odds.get(opp_key)
+        is_over  = side_str == "over"
+        tot_fn   = (lambda tl, ov: lambda v: float((v > tl).mean()) if ov else float((v <= tl).mean()))(tline, is_over)
+        model_p  = float(raw_result.total_over_prob(tline)) if is_over else 1.0 - float(raw_result.total_over_prob(tline))
+        _add_row(
+            "total",
+            f"{'O' if is_over else 'U'} {tline}",
+            side_str, tline, model_p, total_runs, tot_fn, t_odds, opp_odds,
+        )
+
+    for tline in _DEFAULT_TOTAL_LINES:
+        if tline in seen_total_lines:
+            continue
+        for is_over in (True, False):
+            tot_fn2 = (lambda tl, ov: lambda v: float((v > tl).mean()) if ov else float((v <= tl).mean()))(tline, is_over)
+            model_p = float(raw_result.total_over_prob(tline)) if is_over else 1.0 - float(raw_result.total_over_prob(tline))
+            _add_row(
+                "total",
+                f"{'O' if is_over else 'U'} {tline}",
+                "over" if is_over else "under",
+                tline, model_p, total_runs, tot_fn2, None, None,
+            )
+
+    # --- Player props ---
+    if odds_key and odds_api_event_id:
+        try:
+            from src.ingestion.live_odds import get_player_props  # noqa: PLC0415
+            props = get_player_props(odds_api_event_id, try_once=True)
+            for prop in props:
+                player_name = prop.get("player_name", "")
+                market_key  = prop.get("market", "")
+                point       = prop.get("point")
+                over_odds   = prop.get("over_odds")
+                under_odds  = prop.get("under_odds")
+                if point is None:
+                    continue
+
+                # Map market to simulation stat & category
+                if market_key == "pitcher_strikeouts":
+                    cat = "pitcher_prop"
+                elif market_key == "pitcher_earned_runs":
+                    cat = "pitcher_prop"
+                else:
+                    cat = "batter_prop"
+
+                for side_str, mkt_odds, opp_odds in [
+                    ("over",  over_odds,  under_odds),
+                    ("under", under_odds, over_odds),
+                ]:
+                    if mkt_odds is None:
+                        continue
+                    model_p = _prop_model_prob(player_name, market_key, float(point), side_str)
+                    clean_mkt = market_key.replace("batter_", "").replace("pitcher_", "")
+                    lbl = f"{player_name} {clean_mkt} {'O' if side_str == 'over' else 'U'} {point}"
+
+                    # Use total_runs as a proxy distribution for prop bootstrap
+                    # (bootstrapping Poisson-rate props directly from season rates
+                    #  requires individual game logs; use total_runs as a correlated proxy)
+                    rate = _prop_model_prob(player_name, market_key, 0.0, "over")  # crude per-game rate
+                    prop_sim = rng.poisson(max(rate * 5, 0.1), size=len(total_runs)).astype(np.float64)
+                    thresh = float(point)
+                    prop_fn = (lambda t, s: lambda v: float((v > t).mean()) if s == "over" else float((v <= t).mean()))(thresh, side_str)
+
+                    _add_row(
+                        cat, lbl, side_str, float(point),
+                        model_p, prop_sim, prop_fn,
+                        float(mkt_odds) if mkt_odds else None,
+                        float(opp_odds) if opp_odds else None,
+                    )
+        except Exception as exc:
+            logger.warning("game_board: props fetch failed game_id=%d: %s", game_id, exc)
+            omitted.append({"label": "player_props", "reason": str(exc)})
+
+    # ── 6. Sort by confidence_score descending ────────────────────────────
+    rows.sort(key=lambda r: r["confidence_score"], reverse=True)
+
+    return _envelope({
+        "game_id":   game_id,
+        "home_team": home_team,
+        "away_team": away_team,
+        "n_sims":    len(home_runs),
+        "rows":      rows,
+        "omitted":   omitted,
+    })
+
+
+# ===========================================================================
 # Private helpers
 # ===========================================================================
 
